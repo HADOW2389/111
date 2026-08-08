@@ -2,7 +2,6 @@
 #include <Windows.h>
 #include <winternl.h>
 #include <cstdint>
-#include <string>
 #include <vector>
 
 #define SHIELD_DEVICE_NAME    L"\\\\.\\EAZShield"
@@ -12,11 +11,14 @@
 
 #pragma pack(push, 1)
 struct SHIELD_REQUEST {
-    uint32_t magic;
-    uint32_t subcode;
-    uint64_t destination;
-    uint64_t source;
-    uint64_t length;
+    uint32_t header[1];       // 0x00
+    uint32_t magic;           // 0x04: 0x444D4377
+    uint32_t subcode;         // 0x08: 0xf0016
+    uint8_t  padding_1[48];   // 0x0C .. 0x3F
+    uint32_t direction;       // 0x40: 0 = write to kernel, 1 = read from kernel
+    uint32_t size;            // 0x44: bytes count
+    uint64_t kernel_address;  // 0x48: kernel target address
+    uint8_t  buffer[1024];    // 0x50: data buffer
 };
 #pragma pack(pop)
 
