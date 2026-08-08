@@ -36,10 +36,10 @@ namespace offset {
 	constexpr uint64_t ActorsForGC = 0x7D0;
 	constexpr uint64_t GameInstance = 0x3B0;
 	constexpr uint64_t GameState = 0x278;
-	constexpr uint64_t LocalPlayer = 0xF0;
-	constexpr uint64_t PlayerController = 0x38;
-	constexpr uint64_t AcknowledgedPawn = 0x4A8;
-	constexpr uint64_t PlayerCameraManager = 0x4D0;
+	constexpr uint64_t LocalPlayer = 0x38;
+	constexpr uint64_t PlayerController = 0x30;
+	constexpr uint64_t AcknowledgedPawn = 0x04B0;
+	constexpr uint64_t PlayerCameraManager = 0x04D8;
 	constexpr uint32_t ElementsPerChunk = 0x3E4C;
 	constexpr uint64_t ObjID = 0x20;
 	constexpr uint64_t DecryptNameIndexRor = 0x1;
@@ -149,9 +149,9 @@ namespace offset {
 	constexpr uint64_t InputAxisProperties = 0x138;
 
 	constexpr uint64_t LastUpdateVelocity = 0x3E0;
-	constexpr uint64_t Mesh = 0x4A0;
+	constexpr uint64_t Mesh = 0x0480;
 
-	constexpr uint64_t RootComponent = 0x308;
+	constexpr uint64_t RootComponent = 0x01D0;
 	constexpr uint64_t StaticMesh = 0xAE8;
 	constexpr uint64_t Eyes = 0x75C;
 	constexpr uint64_t bAlwaysCreatePhysicsState = 0x488;

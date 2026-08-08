@@ -4,9 +4,6 @@ build/
 *.user
 .vs/
 
-# ImGui downloaded at build time
-Cheat/imgui/
-
 # Compiled output
 *.dll
 *.exe
