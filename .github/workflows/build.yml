@@ -31,23 +31,17 @@ jobs:
         Expand-Archive -Path imgui.zip -DestinationPath .
         $imguiDir = Get-ChildItem -Directory -Filter "imgui-*" | Select-Object -First 1
         New-Item -ItemType Directory -Force -Path "Cheat/imgui"
-        $files = @(
-          "imconfig.h",
-          "imgui.h", "imgui.cpp",
-          "imgui_internal.h",
-          "imgui_draw.cpp",
-          "imgui_tables.cpp",
-          "imgui_widgets.cpp",
-          "backends/imgui_impl_win32.h",
-          "backends/imgui_impl_win32.cpp",
-          "backends/imgui_impl_dx11.h",
-          "backends/imgui_impl_dx11.cpp"
-        )
-        foreach ($f in $files) {
-          $src = Join-Path $imguiDir.FullName $f
-          $dst = "Cheat/imgui/$(Split-Path $f -Leaf)"
-          Copy-Item $src $dst
-        }
+        # Копируем все заголовки и исходники ImGui
+        Get-ChildItem -Path $imguiDir.FullName -Filter "*.h" | Copy-Item -Destination "Cheat/imgui"
+        Get-ChildItem -Path $imguiDir.FullName -Filter "*.cpp" | Copy-Item -Destination "Cheat/imgui"
+        
+        # Копируем бэкенды DX11 и Win32
+        $backendDir = Join-Path $imguiDir.FullName "backends"
+        Copy-Item (Join-Path $backendDir "imgui_impl_win32.h") "Cheat/imgui"
+        Copy-Item (Join-Path $backendDir "imgui_impl_win32.cpp") "Cheat/imgui"
+        Copy-Item (Join-Path $backendDir "imgui_impl_dx11.h") "Cheat/imgui"
+        Copy-Item (Join-Path $backendDir "imgui_impl_dx11.cpp") "Cheat/imgui"
+        
         Write-Host "ImGui files copied:"
         Get-ChildItem "Cheat/imgui"
 

@@ -46,13 +46,20 @@ public:
     static uintptr_t GetOffset(uintptr_t rva)      { return BaseAddress + rva; }
 
     static std::wstring ReadFString(uintptr_t address) {
-        auto fs = Read<FString>(address);
+        FString fs = Read<FString>(address);
         if (!fs.Data || fs.Count <= 0 || fs.Count > 256) return L"";
+        
+        wchar_t buf[256]{};
+        size_t len = static_cast<size_t>(fs.Count) - 1;
+        if (len >= 256) len = 255;
+        
         __try {
-            return std::wstring(fs.Data, static_cast<size_t>(fs.Count) - 1);
+            memcpy(buf, fs.Data, len * sizeof(wchar_t));
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        return L"";
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return L"";
+        }
+        return std::wstring(buf, len);
     }
 };
 

@@ -115,7 +115,7 @@ public:
             localTeam = lc.GetTeam();
         }
 
-        int limit = min(actors.Count, 500);
+        int limit = (actors.Count < 500) ? actors.Count : 500;
         for (int i = 0; i < limit; i++) {
             uintptr_t actorPtr = Memory::Read<uintptr_t>(
                 reinterpret_cast<uintptr_t>(actors.Data) + i * 8);
