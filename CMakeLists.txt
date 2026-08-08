@@ -40,24 +40,3 @@ target_link_libraries(cheat PRIVATE
 if(MSVC)
     target_compile_options(cheat PRIVATE /W3 /O2 /EHsc /MT /GS-)
 endif()
-
-add_executable(Injector WIN32
-    Injector/main.cpp
-)
-
-target_compile_definitions(Injector PRIVATE
-    UNICODE
-    _UNICODE
-    NOMINMAX
-    WIN32_LEAN_AND_MEAN
-    _CRT_SECURE_NO_WARNINGS
-)
-
-target_link_libraries(Injector PRIVATE
-    comdlg32
-    shell32
-)
-
-if(MSVC)
-    target_compile_options(Injector PRIVATE /W3 /O2 /EHsc /MT /std:c++17)
-endif()
