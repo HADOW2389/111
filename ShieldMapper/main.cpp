@@ -43,15 +43,22 @@ bool LoadShieldDriver() {
     }
 
     SC_HANDLE svc = OpenServiceA(scm, "EAZShield", SERVICE_ALL_ACCESS);
-    if (!svc) {
-        svc = CreateServiceA(
-            scm, "EAZShield", "EAZ Shield Driver",
-            SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER,
-            SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
-            driverDest.c_str(),
-            nullptr, nullptr, nullptr, nullptr, nullptr
-        );
+    if (svc) {
+        SERVICE_STATUS ss{};
+        ControlService(svc, SERVICE_CONTROL_STOP, &ss);
+        DeleteService(svc);
+        CloseServiceHandle(svc);
+        Sleep(300);
+        svc = nullptr;
     }
+
+    svc = CreateServiceA(
+        scm, "EAZShield", "EAZ Shield Driver",
+        SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER,
+        SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
+        driverDest.c_str(),
+        nullptr, nullptr, nullptr, nullptr, nullptr
+    );
 
     if (!svc) {
         printf("[!] Failed to create service: %lu\n", GetLastError());
