@@ -1,0 +1,17 @@
+# PUBG Cheat — Build Artifacts
+artifacts/
+build/
+*.user
+.vs/
+
+# ImGui downloaded at build time
+Cheat/imgui/
+
+# Compiled output
+*.dll
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib

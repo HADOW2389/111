@@ -1,0 +1,91 @@
+name: Build PUBG Cheat
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest   # Windows Server 2022 + latest MSVC
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup MSVC (Visual Studio 2022)
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup CMake (latest)
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: 'latest'
+
+    - name: Download ImGui
+      shell: pwsh
+      run: |
+        $imguiVersion = "v1.91.1"
+        $imguiUrl = "https://github.com/ocornut/imgui/archive/refs/tags/$imguiVersion.zip"
+        Invoke-WebRequest -Uri $imguiUrl -OutFile imgui.zip
+        Expand-Archive -Path imgui.zip -DestinationPath .
+        $imguiDir = Get-ChildItem -Directory -Filter "imgui-*" | Select-Object -First 1
+        
+        # Копируем нужные файлы в Cheat/imgui/
+        New-Item -ItemType Directory -Force -Path "PubgCheat/Cheat/imgui"
+        $files = @(
+          "imgui.h", "imgui.cpp",
+          "imgui_internal.h",
+          "imgui_draw.cpp",
+          "imgui_tables.cpp",
+          "imgui_widgets.cpp",
+          "backends/imgui_impl_win32.h",
+          "backends/imgui_impl_win32.cpp",
+          "backends/imgui_impl_dx11.h",
+          "backends/imgui_impl_dx11.cpp"
+        )
+        foreach ($f in $files) {
+          $src = Join-Path $imguiDir.FullName $f
+          $dst = "PubgCheat/Cheat/imgui/$(Split-Path $f -Leaf)"
+          Copy-Item $src $dst
+        }
+
+    - name: Configure CMake
+      shell: pwsh
+      run: |
+        cmake -B build `
+          -S PubgCheat `
+          -G "Visual Studio 17 2022" `
+          -A x64 `
+          -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      shell: pwsh
+      run: |
+        cmake --build build --config Release --parallel
+
+    - name: Collect artifacts
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path artifacts
+        
+        # Injector
+        $inj = Get-ChildItem -Recurse -Filter "Injector.exe" build
+        if ($inj) { Copy-Item $inj.FullName artifacts/ }
+        
+        # Cheat DLL
+        $dll = Get-ChildItem -Recurse -Filter "cheat.dll" build
+        if ($dll) { Copy-Item $dll.FullName artifacts/ }
+        
+        Write-Host "=== Artifacts ==="
+        Get-ChildItem artifacts
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: PubgCheat-Release-x64
+        path: artifacts/
+        retention-days: 30
