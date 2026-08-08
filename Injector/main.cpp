@@ -1,4 +1,5 @@
 #include <Windows.h>
+#include <winternl.h>
 #include <commdlg.h>
 #include <TlHelp32.h>
 #include <string>
@@ -8,6 +9,14 @@
 #include <fstream>
 #include <thread>
 #include <atomic>
+
+#ifndef NTSTATUS
+typedef LONG NTSTATUS;
+#endif
+
+#ifndef NTAPI
+#define NTAPI __stdcall
+#endif
 
 static HWND g_hWnd;
 static HWND g_hStatus;
