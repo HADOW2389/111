@@ -1,7 +1,12 @@
 #include "intel_driver.hpp"
 #include <Windows.h>
+#include <winioctl.h>
 #include <string>
 #include <fstream>
+
+#ifndef FILE_ANY_ACCESS
+#define FILE_ANY_ACCESS 0
+#endif
 
 #include "utils.hpp"
 #include "intel_driver_resource.hpp"

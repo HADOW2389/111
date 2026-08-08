@@ -1,6 +1,11 @@
 #pragma once
 
 #include <Windows.h>
+#include <winternl.h>
+#include <ntstatus.h>
+#ifndef NTSTATUS
+typedef LONG NTSTATUS;
+#endif
 
 namespace kdmapper
 {
