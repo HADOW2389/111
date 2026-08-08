@@ -57,6 +57,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Setup WDK (Windows Driver Kit)
+      uses: winnt-dev/setup-wdk@v1
+
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
 
