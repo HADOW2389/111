@@ -43,7 +43,6 @@ if(MSVC)
 endif()
 
 # 2. Kernel Driver Target (BlindEye.sys)
-# Ищем точный путь к ntifs.h во всех установленных Windows Kits
 file(GLOB WDK_NTIFS_HEADER "C:/Program Files (x86)/Windows Kits/10/Include/10.*/km/ntifs.h")
 
 if(WDK_NTIFS_HEADER)
@@ -53,9 +52,6 @@ if(WDK_NTIFS_HEADER)
     get_filename_component(WDK_VERSION_NAME "${WDK_INC_VERSION_DIR}" NAME)
 
     set(WDK_LIB_DIR "C:/Program Files (x86)/Windows Kits/10/Lib/${WDK_VERSION_NAME}/km/x64")
-
-    message(STATUS "Found WDK Include KM Dir: ${WDK_KM_DIR}")
-    message(STATUS "Found WDK Lib KM Dir: ${WDK_LIB_DIR}")
 
     add_library(BlindEye SHARED
         BlindEye/DriverEntry.cpp
@@ -67,6 +63,7 @@ if(WDK_NTIFS_HEADER)
     set_target_properties(BlindEye PROPERTIES
         OUTPUT_NAME "BlindEye"
         SUFFIX ".sys"
+        LINK_FLAGS "/MANIFEST:NO /NODEFAULTLIB"
     )
 
     target_include_directories(BlindEye PRIVATE
@@ -97,13 +94,14 @@ if(WDK_NTIFS_HEADER)
         /DRIVER
         /ENTRY:DriverEntry
         /SUBSYSTEM:NATIVE
+        /MANIFEST:NO
+        /NODEFAULTLIB
         /LIBPATH:${WDK_LIB_DIR}
     )
 
     target_link_libraries(BlindEye PRIVATE
         ntoskrnl.lib
         hal.lib
+        BufferOverflowK.lib
     )
-else()
-    message(WARNING "ntifs.h not found in Windows Kits! BlindEye.sys skipped.")
 endif()
