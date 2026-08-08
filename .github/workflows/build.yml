@@ -57,8 +57,10 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup WDK (Windows Driver Kit)
-      uses: winnt-dev/setup-wdk@v1
+    - name: Install WDK (Windows Driver Kit) via Chocolatey
+      shell: pwsh
+      run: |
+        choco install windowsdriverkit10 -y --no-progress
 
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
