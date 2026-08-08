@@ -1,4 +1,4 @@
-name: Build PUBG Cheat DLL
+name: Build PUBG Cheat & BlindEye Driver
 
 on:
   push:
@@ -8,7 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-dll:
+    name: Build cheat.dll
     runs-on: windows-latest
 
     steps:
@@ -33,7 +34,7 @@ jobs:
       run: |
         cmake --build build --config Release --parallel
 
-    - name: Collect artifacts
+    - name: Collect DLL artifact
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path artifacts
@@ -41,9 +42,41 @@ jobs:
         if ($dll) { Copy-Item $dll.FullName artifacts/ }
         Get-ChildItem artifacts
 
-    - name: Upload artifacts
+    - name: Upload cheat.dll artifact
       uses: actions/upload-artifact@v4
       with:
         name: cheat.dll
         path: artifacts/cheat.dll
+        retention-days: 30
+
+  build-driver:
+    name: Build BlindEye.sys Driver
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build BlindEye Driver
+      shell: pwsh
+      run: |
+        cd BlindEye
+        msbuild BlindEye.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10
+
+    - name: Collect Driver artifact
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path driver_artifacts
+        $sys = Get-ChildItem -Recurse -Filter "*.sys" BlindEye
+        if ($sys) { Copy-Item $sys.FullName driver_artifacts/ }
+        Get-ChildItem driver_artifacts
+
+    - name: Upload BlindEye.sys artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: BlindEye.sys
+        path: driver_artifacts/
         retention-days: 30
