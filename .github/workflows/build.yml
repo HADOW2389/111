@@ -1,4 +1,4 @@
-name: Build PUBG Cheat DLL & BlindEye Driver
+name: Build PUBG Cheat DLL, BlindEye Driver & KDMapper
 
 on:
   push:
@@ -9,12 +9,14 @@ on:
 
 jobs:
   build:
-    name: Build cheat.dll & BlindEye.sys
+    name: Build All Release Binaries
     runs-on: windows-latest
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Install WDK via Chocolatey
       shell: pwsh
@@ -45,13 +47,15 @@ jobs:
         New-Item -ItemType Directory -Force -Path artifacts
         $dll = Get-ChildItem -Recurse -Filter "cheat.dll" build
         if ($dll) { Copy-Item $dll.FullName artifacts/ }
-        $sys = Get-ChildItem -Recurse -Filter "*.sys" build
+        $sys = Get-ChildItem -Recurse -Filter "BlindEye.sys" build
         if ($sys) { Copy-Item $sys.FullName artifacts/ }
+        $exe = Get-ChildItem -Recurse -Filter "kdmapper.exe" build
+        if ($exe) { Copy-Item $exe.FullName artifacts/ }
         Get-ChildItem artifacts
 
-    - name: Upload artifacts
+    - name: Upload Full Release Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: PubgCheat-Release-Files
+        name: PubgCheat-Full-Release
         path: artifacts/
         retention-days: 30

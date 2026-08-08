@@ -105,3 +105,33 @@ if(WDK_NTIFS_HEADER)
         BufferOverflowK.lib
     )
 endif()
+
+# 3. KDMapper Target (kdmapper.exe)
+if(EXISTS "${CMAKE_SOURCE_DIR}/kdmapper/kdmapper")
+    add_executable(kdmapper
+        kdmapper/kdmapper/main.cpp
+        kdmapper/kdmapper/kdmapper.cpp
+        kdmapper/kdmapper/intel_driver.cpp
+        kdmapper/kdmapper/portable_executable.cpp
+        kdmapper/kdmapper/service.cpp
+        kdmapper/kdmapper/utils.cpp
+        kdmapper/kdmapper/KDSymbolsHandler.cpp
+    )
+
+    target_include_directories(kdmapper PRIVATE
+        ${CMAKE_SOURCE_DIR}/kdmapper/kdmapper
+        ${CMAKE_SOURCE_DIR}/kdmapper/kdmapper/include
+    )
+
+    target_compile_definitions(kdmapper PRIVATE
+        UNICODE
+        _UNICODE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        _CRT_SECURE_NO_WARNINGS
+    )
+
+    if(MSVC)
+        target_compile_options(kdmapper PRIVATE /W3 /O2 /EHsc /MT /std:c++17)
+    endif()
+endif()
