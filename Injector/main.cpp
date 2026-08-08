@@ -4,6 +4,8 @@
 #include <string>
 #include <filesystem>
 #include <sstream>
+#include <vector>
+#include <fstream>
 
 static HWND g_hWnd;
 static HWND g_hStatus;
@@ -13,6 +15,32 @@ static HWND g_hBrowseBtn;
 static HWND g_hProcessList;
 static HWND g_hRefreshBtn;
 static std::string g_DllPath;
+
+void StatusMsg(const std::string& msg) {
+    SetWindowTextA(g_hStatus, msg.c_str());
+}
+
+bool EnableDebugPrivilege() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return false;
+
+    LUID luid{};
+    if (!LookupPrivilegeValueA(nullptr, "SeDebugPrivilege", &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    BOOL ok = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    DWORD err = GetLastError();
+    CloseHandle(hToken);
+    return ok && err == ERROR_SUCCESS;
+}
 
 DWORD FindProcess(const wchar_t* name) {
     PROCESSENTRY32W pe{};
@@ -29,50 +57,229 @@ DWORD FindProcess(const wchar_t* name) {
     return pid;
 }
 
-bool InjectDLL(DWORD pid, const std::string& dllPath) {
-    if (dllPath.empty() || !std::filesystem::exists(dllPath)) {
-        SetWindowTextA(g_hStatus, "[-] DLL file not found!");
+struct ManualMapData {
+    FARPROC pLoadLibraryA;
+    FARPROC pGetProcAddress;
+    HMODULE hModule;
+};
+
+using fnDllMain = BOOL(WINAPI*)(HMODULE, DWORD, LPVOID);
+
+#pragma runtime_checks("", off)
+void __stdcall ShellCode(ManualMapData* data) {
+    if (!data) return;
+
+    auto pBase = reinterpret_cast<BYTE*>(data->hModule);
+    auto pDosH = reinterpret_cast<IMAGE_DOS_HEADER*>(pBase);
+    auto pNtH  = reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + pDosH->e_lfanew);
+    auto pOptH = &pNtH->OptionalHeader;
+
+    auto _LoadLibraryA   = reinterpret_cast<decltype(&LoadLibraryA)>(data->pLoadLibraryA);
+    auto _GetProcAddress = reinterpret_cast<decltype(&GetProcAddress)>(data->pGetProcAddress);
+
+    BYTE* locationDelta = pBase - pOptH->ImageBase;
+    if (locationDelta) {
+        if (!pOptH->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) return;
+
+        auto pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+            pBase + pOptH->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+
+        while (pRelocData->VirtualAddress) {
+            UINT count = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+            auto pRelInfo = reinterpret_cast<WORD*>(pRelocData + 1);
+
+            for (UINT i = 0; i < count; i++, pRelInfo++) {
+                if ((*pRelInfo >> 12) == IMAGE_REL_BASED_DIR64) {
+                    auto pPatch = reinterpret_cast<UINT_PTR*>(
+                        pBase + pRelocData->VirtualAddress + (*pRelInfo & 0xFFF));
+                    *pPatch += reinterpret_cast<UINT_PTR>(locationDelta);
+                }
+            }
+            pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+                reinterpret_cast<BYTE*>(pRelocData) + pRelocData->SizeOfBlock);
+        }
+    }
+
+    if (pOptH->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
+        auto pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+            pBase + pOptH->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+        while (pImportDesc->Name) {
+            char* modName = reinterpret_cast<char*>(pBase + pImportDesc->Name);
+            HMODULE hDll = _LoadLibraryA(modName);
+
+            auto pThunk    = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->OriginalFirstThunk);
+            auto pFuncRef  = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
+
+            if (!pImportDesc->OriginalFirstThunk)
+                pThunk = pFuncRef;
+
+            for (; pThunk->u1.AddressOfData; pThunk++, pFuncRef++) {
+                if (IMAGE_SNAP_BY_ORDINAL(pThunk->u1.Ordinal)) {
+                    pFuncRef->u1.Function = reinterpret_cast<UINT_PTR>(
+                        _GetProcAddress(hDll, reinterpret_cast<char*>(pThunk->u1.Ordinal & 0xFFFF)));
+                } else {
+                    auto pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                        pBase + pThunk->u1.AddressOfData);
+                    pFuncRef->u1.Function = reinterpret_cast<UINT_PTR>(
+                        _GetProcAddress(hDll, pImport->Name));
+                }
+            }
+            pImportDesc++;
+        }
+    }
+
+    if (pOptH->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) {
+        auto pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(
+            pBase + pOptH->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+        auto pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
+        if (pCallback) {
+            for (; *pCallback; pCallback++)
+                (*pCallback)(reinterpret_cast<PVOID>(pBase), DLL_PROCESS_ATTACH, nullptr);
+        }
+    }
+
+    auto pDllMain = reinterpret_cast<fnDllMain>(pBase + pOptH->AddressOfEntryPoint);
+    pDllMain(reinterpret_cast<HMODULE>(pBase), DLL_PROCESS_ATTACH, nullptr);
+}
+
+void __stdcall ShellCodeEnd() {}
+#pragma runtime_checks("", restore)
+
+bool ManualMapInject(DWORD pid, const std::string& dllPath) {
+    std::ifstream file(dllPath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        StatusMsg("[-] Cannot open DLL file!");
         return false;
     }
 
-    std::string fullPath = std::filesystem::absolute(dllPath).string();
-    HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    auto fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<BYTE> rawDll(fileSize);
+    file.read(reinterpret_cast<char*>(rawDll.data()), fileSize);
+    file.close();
+
+    auto pDosH = reinterpret_cast<IMAGE_DOS_HEADER*>(rawDll.data());
+    if (pDosH->e_magic != IMAGE_DOS_SIGNATURE) {
+        StatusMsg("[-] Invalid DLL: bad DOS signature!");
+        return false;
+    }
+
+    auto pNtH = reinterpret_cast<IMAGE_NT_HEADERS*>(rawDll.data() + pDosH->e_lfanew);
+    if (pNtH->Signature != IMAGE_NT_SIGNATURE) {
+        StatusMsg("[-] Invalid DLL: bad NT signature!");
+        return false;
+    }
+
+    if (pNtH->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
+        StatusMsg("[-] DLL must be x64!");
+        return false;
+    }
+
+    HANDLE hProc = OpenProcess(
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION,
+        FALSE, pid);
+
     if (!hProc) {
-        SetWindowTextA(g_hStatus, ("[-] OpenProcess failed: " + std::to_string(GetLastError())).c_str());
+        StatusMsg("[-] OpenProcess failed: " + std::to_string(GetLastError()));
         return false;
     }
 
-    SIZE_T pathLen = fullPath.size() + 1;
-    LPVOID remoteMem = VirtualAllocEx(hProc, nullptr, pathLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remoteMem) {
+    SIZE_T imageSize = pNtH->OptionalHeader.SizeOfImage;
+    LPVOID pTargetBase = VirtualAllocEx(hProc, nullptr, imageSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+    if (!pTargetBase) {
+        DWORD err = GetLastError();
         CloseHandle(hProc);
-        SetWindowTextA(g_hStatus, "[-] VirtualAllocEx failed!");
+        StatusMsg("[-] VirtualAllocEx failed: " + std::to_string(err));
         return false;
     }
 
-    if (!WriteProcessMemory(hProc, remoteMem, fullPath.c_str(), pathLen, nullptr)) {
-        VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+    StatusMsg("[*] Allocated " + std::to_string(imageSize) + " bytes at remote base...");
+
+    if (!WriteProcessMemory(hProc, pTargetBase, rawDll.data(),
+        pNtH->OptionalHeader.SizeOfHeaders, nullptr)) {
+        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
         CloseHandle(hProc);
-        SetWindowTextA(g_hStatus, "[-] WriteProcessMemory failed!");
+        StatusMsg("[-] WriteProcessMemory (headers) failed!");
+        return false;
+    }
+
+    auto pSectionH = IMAGE_FIRST_SECTION(pNtH);
+    for (WORD i = 0; i < pNtH->FileHeader.NumberOfSections; i++, pSectionH++) {
+        if (pSectionH->SizeOfRawData == 0) continue;
+
+        if (!WriteProcessMemory(hProc,
+            static_cast<BYTE*>(pTargetBase) + pSectionH->VirtualAddress,
+            rawDll.data() + pSectionH->PointerToRawData,
+            pSectionH->SizeOfRawData, nullptr))
+        {
+            VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+            CloseHandle(hProc);
+            StatusMsg("[-] WriteProcessMemory (section) failed!");
+            return false;
+        }
+    }
+
+    ManualMapData mapData{};
+    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+    mapData.pLoadLibraryA   = GetProcAddress(hK32, "LoadLibraryA");
+    mapData.pGetProcAddress = GetProcAddress(hK32, "GetProcAddress");
+    mapData.hModule         = reinterpret_cast<HMODULE>(pTargetBase);
+
+    SIZE_T shellSize = reinterpret_cast<BYTE*>(ShellCodeEnd) - reinterpret_cast<BYTE*>(ShellCode);
+    SIZE_T totalAlloc = shellSize + sizeof(ManualMapData) + 64;
+
+    LPVOID pShellMem = VirtualAllocEx(hProc, nullptr, totalAlloc,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+    if (!pShellMem) {
+        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+        CloseHandle(hProc);
+        StatusMsg("[-] VirtualAllocEx (shellcode) failed: " + std::to_string(GetLastError()));
+        return false;
+    }
+
+    BYTE* pDataRemote = static_cast<BYTE*>(pShellMem) + shellSize + 16;
+
+    if (!WriteProcessMemory(hProc, pShellMem, ShellCode, shellSize, nullptr)) {
+        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+        VirtualFreeEx(hProc, pShellMem, 0, MEM_RELEASE);
+        CloseHandle(hProc);
+        StatusMsg("[-] WriteProcessMemory (shellcode) failed!");
+        return false;
+    }
+
+    if (!WriteProcessMemory(hProc, pDataRemote, &mapData, sizeof(mapData), nullptr)) {
+        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+        VirtualFreeEx(hProc, pShellMem, 0, MEM_RELEASE);
+        CloseHandle(hProc);
+        StatusMsg("[-] WriteProcessMemory (data) failed!");
         return false;
     }
 
     HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0,
-        (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA"),
-        remoteMem, 0, nullptr);
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellMem),
+        pDataRemote, 0, nullptr);
 
     if (!hThread) {
-        VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+        DWORD err = GetLastError();
+        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+        VirtualFreeEx(hProc, pShellMem, 0, MEM_RELEASE);
         CloseHandle(hProc);
-        SetWindowTextA(g_hStatus, ("[-] CreateRemoteThread failed: " + std::to_string(GetLastError())).c_str());
+        StatusMsg("[-] CreateRemoteThread failed: " + std::to_string(err));
         return false;
     }
 
-    WaitForSingleObject(hThread, 5000);
+    WaitForSingleObject(hThread, 10000);
     CloseHandle(hThread);
-    VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+
+    VirtualFreeEx(hProc, pShellMem, 0, MEM_RELEASE);
     CloseHandle(hProc);
-    SetWindowTextA(g_hStatus, "[+] Injected successfully!");
+
+    StatusMsg("[+] ManualMap injection successful!");
     return true;
 }
 
@@ -112,12 +319,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (LOWORD(wParam) == 2) {
             DWORD pid = FindProcess(L"TslGame-Win64-Shipping.exe");
             if (!pid) pid = FindProcess(L"TslGame.exe");
-            if (!pid) { SetWindowTextA(g_hStatus, "[-] PUBG not found!"); return 0; }
+            if (!pid) { StatusMsg("[-] PUBG not found!"); return 0; }
             char pathBuf[MAX_PATH]{};
             GetWindowTextA(g_hDllPath, pathBuf, MAX_PATH);
             g_DllPath = pathBuf;
-            SetWindowTextA(g_hStatus, ("[*] Injecting into PID: " + std::to_string(pid)).c_str());
-            InjectDLL(pid, g_DllPath);
+            StatusMsg("[*] Enabling SeDebugPrivilege...");
+            if (!EnableDebugPrivilege())
+                StatusMsg("[!] SeDebugPrivilege failed, trying anyway...");
+            StatusMsg("[*] ManualMap injecting into PID: " + std::to_string(pid));
+            ManualMapInject(pid, g_DllPath);
         }
         else if (LOWORD(wParam) == 3) {
             RefreshProcessList();
@@ -155,6 +365,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    EnableDebugPrivilege();
+
     WNDCLASSEXA wc{};
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = WndProc;
@@ -200,12 +412,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     SendMessage(g_hProcessList, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     g_hStatus = CreateWindowExA(WS_EX_CLIENTEDGE, "STATIC",
-        "[*] Ready. Select DLL and click Inject.",
+        "[*] Ready. Run as Admin. Select DLL and click Inject.",
         WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 375, 442, 40, g_hWnd, nullptr, hInst, nullptr);
     SendMessage(g_hStatus, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    g_hInjectBtn = CreateWindowExA(0, "BUTTON", "INJECT",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 130, 422, 200, 36, g_hWnd, (HMENU)2, hInst, nullptr);
+    g_hInjectBtn = CreateWindowExA(0, "BUTTON", "INJECT (ManualMap)",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 110, 422, 240, 36, g_hWnd, (HMENU)2, hInst, nullptr);
     HFONT hBigFont = CreateFontA(18, 0, 0, 0, FW_BOLD, 0, 0, 0,
         DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     SendMessage(g_hInjectBtn, WM_SETFONT, (WPARAM)hBigFont, TRUE);
