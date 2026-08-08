@@ -16,6 +16,13 @@ std::vector<uint8_t> ReadFileToBuffer(const std::string& path) {
 }
 
 bool LoadShieldDriver() {
+    HANDLE test = CreateFileW(L"\\\\.\\EAZShield", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (test != INVALID_HANDLE_VALUE) {
+        CloseHandle(test);
+        printf("[+] shield.sys already loaded\n");
+        return true;
+    }
+
     std::string sysPath;
     char winDir[MAX_PATH]{};
     GetWindowsDirectoryA(winDir, MAX_PATH);
