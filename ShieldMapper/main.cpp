@@ -153,13 +153,20 @@ int main(int argc, char* argv[]) {
     printf("[+] ntoskrnl.exe @ 0x%llx\n", ntBase);
 
     uint16_t testVal = 0;
-    if (!ShieldDriver::ReadKernel(hDevice, ntBase, &testVal, sizeof(testVal)) || testVal != IMAGE_DOS_SIGNATURE) {
-        printf("[!] Kernel read test failed\n");
+    if (!ShieldDriver::ReadKernel(hDevice, ntBase, &testVal, sizeof(testVal))) {
+        printf("[!] ReadKernel call returned false\n");
         ShieldDriver::Close(hDevice);
         UnloadShieldDriver();
         return 1;
     }
-    printf("[+] Kernel R/W verified\n");
+
+    if (testVal != IMAGE_DOS_SIGNATURE) {
+        printf("[!] Kernel read value mismatched: got 0x%04X, expected 0x%04X (MZ)\n", testVal, IMAGE_DOS_SIGNATURE);
+        ShieldDriver::Close(hDevice);
+        UnloadShieldDriver();
+        return 1;
+    }
+    printf("[+] Kernel R/W verified (0x%04X)\n", testVal);
 
     bool success = Mapper::MapDriver(hDevice, driverImage);
 

@@ -57,6 +57,8 @@ namespace ShieldDriver {
                 return false;
             }
 
+            // printf("[*] DeviceIoControl ret=%lu bytes\n", bytesReturned);
+
             memcpy(outPtr, req.buffer, chunkSize);
 
             currAddr += chunkSize;
