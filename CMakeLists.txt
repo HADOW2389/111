@@ -135,3 +135,29 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/kdmapper/kdmapper")
         target_compile_options(kdmapper PRIVATE /W3 /O2 /EHsc /MT /std:c++17)
     endif()
 endif()
+
+# 4. ShieldMapper Target (ShieldMapper.exe)
+add_executable(ShieldMapper
+    ShieldMapper/main.cpp
+    ShieldMapper/shield_driver.cpp
+    ShieldMapper/mapper.cpp
+)
+
+target_include_directories(ShieldMapper PRIVATE
+    ${CMAKE_SOURCE_DIR}/ShieldMapper
+)
+
+target_compile_definitions(ShieldMapper PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+
+target_link_libraries(ShieldMapper PRIVATE
+    psapi
+    ntdll
+)
+
+if(MSVC)
+    target_compile_options(ShieldMapper PRIVATE /W3 /O2 /EHsc /MT /std:c++17)
+endif()

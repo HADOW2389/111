@@ -1,4 +1,4 @@
-name: Build PUBG Cheat DLL, BlindEye Driver & KDMapper
+name: Build PUBG Cheat DLL, BlindEye Driver, KDMapper & ShieldMapper
 
 on:
   push:
@@ -51,6 +51,8 @@ jobs:
         if ($sys) { Copy-Item $sys.FullName artifacts/ }
         $exe = Get-ChildItem -Recurse -Filter "kdmapper.exe" build
         if ($exe) { Copy-Item $exe.FullName artifacts/ }
+        $sm = Get-ChildItem -Recurse -Filter "ShieldMapper.exe" build
+        if ($sm) { Copy-Item $sm.FullName artifacts/ }
         Get-ChildItem artifacts
 
     - name: Upload Full Release Artifacts
