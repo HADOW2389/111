@@ -1,4 +1,4 @@
-name: Build PUBG Cheat & BlindEye Driver
+name: Build PUBG Cheat DLL & BlindEye Driver
 
 on:
   push:
@@ -8,13 +8,18 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-dll:
-    name: Build cheat.dll
+  build:
+    name: Build cheat.dll & BlindEye.sys
     runs-on: windows-latest
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Install WDK via Chocolatey
+      shell: pwsh
+      run: |
+        choco install windowsdriverkit10 -y --no-progress
 
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
@@ -29,59 +34,24 @@ jobs:
       run: |
         cmake -B build -S . -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 
-    - name: Build DLL
+    - name: Build All Targets
       shell: pwsh
       run: |
         cmake --build build --config Release --parallel
 
-    - name: Collect DLL artifact
+    - name: Collect artifacts
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path artifacts
         $dll = Get-ChildItem -Recurse -Filter "cheat.dll" build
         if ($dll) { Copy-Item $dll.FullName artifacts/ }
+        $sys = Get-ChildItem -Recurse -Filter "*.sys" build
+        if ($sys) { Copy-Item $sys.FullName artifacts/ }
         Get-ChildItem artifacts
 
-    - name: Upload cheat.dll artifact
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: cheat.dll
-        path: artifacts/cheat.dll
-        retention-days: 30
-
-  build-driver:
-    name: Build BlindEye.sys Driver
-    runs-on: windows-latest
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Install WDK (Windows Driver Kit) via Chocolatey
-      shell: pwsh
-      run: |
-        choco install windowsdriverkit10 -y --no-progress
-
-    - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v2
-
-    - name: Build BlindEye Driver
-      shell: pwsh
-      run: |
-        cd BlindEye
-        msbuild BlindEye.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10
-
-    - name: Collect Driver artifact
-      shell: pwsh
-      run: |
-        New-Item -ItemType Directory -Force -Path driver_artifacts
-        $sys = Get-ChildItem -Recurse -Filter "*.sys" BlindEye
-        if ($sys) { Copy-Item $sys.FullName driver_artifacts/ }
-        Get-ChildItem driver_artifacts
-
-    - name: Upload BlindEye.sys artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: BlindEye.sys
-        path: driver_artifacts/
+        name: PubgCheat-Release-Files
+        path: artifacts/
         retention-days: 30
