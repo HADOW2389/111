@@ -17,13 +17,21 @@ public:
     }
 
     template<typename T>
+    static bool SafeRead(uintptr_t address, T* out) {
+        if (!address || address < 0x1000) return false;
+        __try {
+            *out = *reinterpret_cast<const T*>(address);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    template<typename T>
     static T Read(uintptr_t address) {
         T result{};
-        if (!address || address < 0x1000) return result;
-        __try {
-            result = *reinterpret_cast<T*>(address);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        SafeRead(address, &result);
         return result;
     }
 
@@ -53,13 +61,13 @@ public:
         size_t len = static_cast<size_t>(fs.Count) - 1;
         if (len >= 256) len = 255;
         
-        __try {
-            memcpy(buf, fs.Data, len * sizeof(wchar_t));
+        for (size_t i = 0; i < len; i++) {
+            wchar_t ch = 0;
+            if (!SafeRead(reinterpret_cast<uintptr_t>(fs.Data + i), &ch))
+                break;
+            buf[i] = ch;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            return L"";
-        }
-        return std::wstring(buf, len);
+        return std::wstring(buf);
     }
 };
 
