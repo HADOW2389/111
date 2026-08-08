@@ -4,7 +4,7 @@ project(PubgCheat LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 1. DLL Target
+# 1. DLL Target (cheat.dll)
 add_library(cheat SHARED
     Cheat/main.cpp
     Cheat/UI.cpp
@@ -43,14 +43,20 @@ if(MSVC)
 endif()
 
 # 2. Kernel Driver Target (BlindEye.sys)
-set(WDK_PATH "C:/Program Files (x86)/Windows Kits/10")
-file(GLOB WDK_INC_VERSIONS "${WDK_PATH}/Include/10.*")
-list(GET WDK_INC_VERSIONS -1 LATEST_WDK_INC)
+# Ищем точный путь к ntifs.h во всех установленных Windows Kits
+file(GLOB WDK_NTIFS_HEADER "C:/Program Files (x86)/Windows Kits/10/Include/10.*/km/ntifs.h")
 
-file(GLOB WDK_LIB_VERSIONS "${WDK_PATH}/Lib/10.*")
-list(GET WDK_LIB_VERSIONS -1 LATEST_WDK_LIB)
+if(WDK_NTIFS_HEADER)
+    list(GET WDK_NTIFS_HEADER -1 FOUND_NTIFS)
+    get_filename_component(WDK_KM_DIR "${FOUND_NTIFS}" DIRECTORY)
+    get_filename_component(WDK_INC_VERSION_DIR "${WDK_KM_DIR}" DIRECTORY)
+    get_filename_component(WDK_VERSION_NAME "${WDK_INC_VERSION_DIR}" NAME)
 
-if(EXISTS "${LATEST_WDK_INC}")
+    set(WDK_LIB_DIR "C:/Program Files (x86)/Windows Kits/10/Lib/${WDK_VERSION_NAME}/km/x64")
+
+    message(STATUS "Found WDK Include KM Dir: ${WDK_KM_DIR}")
+    message(STATUS "Found WDK Lib KM Dir: ${WDK_LIB_DIR}")
+
     add_library(BlindEye SHARED
         BlindEye/DriverEntry.cpp
         BlindEye/DriverUtil.cpp
@@ -64,9 +70,9 @@ if(EXISTS "${LATEST_WDK_INC}")
     )
 
     target_include_directories(BlindEye PRIVATE
-        ${LATEST_WDK_INC}/km
-        ${LATEST_WDK_INC}/km/crt
-        ${LATEST_WDK_INC}/shared
+        ${WDK_KM_DIR}
+        ${WDK_INC_VERSION_DIR}/km/crt
+        ${WDK_INC_VERSION_DIR}/shared
         ${CMAKE_SOURCE_DIR}/BlindEye
     )
 
@@ -91,11 +97,13 @@ if(EXISTS "${LATEST_WDK_INC}")
         /DRIVER
         /ENTRY:DriverEntry
         /SUBSYSTEM:NATIVE
-        /LIBPATH:${LATEST_WDK_LIB}/km/x64
+        /LIBPATH:${WDK_LIB_DIR}
     )
 
     target_link_libraries(BlindEye PRIVATE
         ntoskrnl.lib
         hal.lib
     )
+else()
+    message(WARNING "ntifs.h not found in Windows Kits! BlindEye.sys skipped.")
 endif()
