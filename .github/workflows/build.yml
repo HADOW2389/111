@@ -32,6 +32,7 @@ jobs:
         $imguiDir = Get-ChildItem -Directory -Filter "imgui-*" | Select-Object -First 1
         New-Item -ItemType Directory -Force -Path "Cheat/imgui"
         $files = @(
+          "imconfig.h",
           "imgui.h", "imgui.cpp",
           "imgui_internal.h",
           "imgui_draw.cpp",
