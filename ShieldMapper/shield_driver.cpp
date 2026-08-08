@@ -52,7 +52,10 @@ namespace ShieldDriver {
                 &bytesReturned, nullptr
             );
 
-            if (!res) return false;
+            if (!res) {
+                printf("[!] DeviceIoControl failed: %lu (0x%X)\n", GetLastError(), GetLastError());
+                return false;
+            }
 
             memcpy(outPtr, req.buffer, chunkSize);
 
