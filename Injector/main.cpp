@@ -6,15 +6,19 @@
 #include <sstream>
 #include <vector>
 #include <fstream>
+#include <thread>
+#include <atomic>
 
 static HWND g_hWnd;
 static HWND g_hStatus;
 static HWND g_hDllPath;
 static HWND g_hInjectBtn;
+static HWND g_hWatchBtn;
 static HWND g_hBrowseBtn;
 static HWND g_hProcessList;
 static HWND g_hRefreshBtn;
 static std::string g_DllPath;
+static std::atomic<bool> g_Watching{false};
 
 void StatusMsg(const std::string& msg) {
     SetWindowTextA(g_hStatus, msg.c_str());
@@ -57,6 +61,90 @@ DWORD FindProcess(const wchar_t* name) {
     return pid;
 }
 
+using fnNtOpenProcess = NTSTATUS(NTAPI*)(
+    PHANDLE ProcessHandle,
+    ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes,
+    PVOID ClientId);
+
+using fnNtAllocateVirtualMemory = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle,
+    PVOID* BaseAddress,
+    ULONG_PTR ZeroBits,
+    PSIZE_T RegionSize,
+    ULONG AllocationType,
+    ULONG Protect);
+
+using fnNtWriteVirtualMemory = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    SIZE_T NumberOfBytesToWrite,
+    PSIZE_T NumberOfBytesWritten);
+
+using fnNtCreateThreadEx = NTSTATUS(NTAPI*)(
+    PHANDLE ThreadHandle,
+    ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes,
+    HANDLE ProcessHandle,
+    PVOID StartRoutine,
+    PVOID Argument,
+    ULONG CreateFlags,
+    SIZE_T ZeroBits,
+    SIZE_T StackSize,
+    SIZE_T MaximumStackSize,
+    PVOID AttributeList);
+
+struct NtApi {
+    fnNtOpenProcess            NtOpenProcess = nullptr;
+    fnNtAllocateVirtualMemory  NtAllocateVirtualMemory = nullptr;
+    fnNtWriteVirtualMemory     NtWriteVirtualMemory = nullptr;
+    fnNtCreateThreadEx         NtCreateThreadEx = nullptr;
+
+    bool Init() {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (!ntdll) return false;
+        NtOpenProcess           = (fnNtOpenProcess)GetProcAddress(ntdll, "NtOpenProcess");
+        NtAllocateVirtualMemory = (fnNtAllocateVirtualMemory)GetProcAddress(ntdll, "NtAllocateVirtualMemory");
+        NtWriteVirtualMemory    = (fnNtWriteVirtualMemory)GetProcAddress(ntdll, "NtWriteVirtualMemory");
+        NtCreateThreadEx        = (fnNtCreateThreadEx)GetProcAddress(ntdll, "NtCreateThreadEx");
+        return NtOpenProcess && NtAllocateVirtualMemory && NtWriteVirtualMemory && NtCreateThreadEx;
+    }
+};
+
+static NtApi g_Nt;
+
+HANDLE NtOpenProc(DWORD pid) {
+    HANDLE hProc = nullptr;
+
+    struct {
+        ULONG Length;
+        HANDLE RootDirectory;
+        PVOID ObjectName;
+        ULONG Attributes;
+        PVOID SecurityDescriptor;
+        PVOID SecurityQualityOfService;
+    } oa{};
+    oa.Length = sizeof(oa);
+
+    struct { HANDLE UniqueProcess; HANDLE UniqueThread; } cid{};
+    cid.UniqueProcess = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid));
+
+    NTSTATUS status = g_Nt.NtOpenProcess(
+        &hProc,
+        PROCESS_ALL_ACCESS,
+        &oa,
+        &cid);
+
+    if (status != 0) {
+        hProc = OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
+            PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION,
+            FALSE, pid);
+    }
+    return hProc;
+}
+
 struct ManualMapData {
     FARPROC pLoadLibraryA;
     FARPROC pGetProcAddress;
@@ -66,6 +154,7 @@ struct ManualMapData {
 using fnDllMain = BOOL(WINAPI*)(HMODULE, DWORD, LPVOID);
 
 #pragma runtime_checks("", off)
+#pragma optimize("", off)
 void __stdcall ShellCode(ManualMapData* data) {
     if (!data) return;
 
@@ -108,8 +197,8 @@ void __stdcall ShellCode(ManualMapData* data) {
             char* modName = reinterpret_cast<char*>(pBase + pImportDesc->Name);
             HMODULE hDll = _LoadLibraryA(modName);
 
-            auto pThunk    = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->OriginalFirstThunk);
-            auto pFuncRef  = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
+            auto pThunk   = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->OriginalFirstThunk);
+            auto pFuncRef = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
 
             if (!pImportDesc->OriginalFirstThunk)
                 pThunk = pFuncRef;
@@ -144,6 +233,7 @@ void __stdcall ShellCode(ManualMapData* data) {
 }
 
 void __stdcall ShellCodeEnd() {}
+#pragma optimize("", on)
 #pragma runtime_checks("", restore)
 
 bool ManualMapInject(DWORD pid, const std::string& dllPath) {
@@ -176,51 +266,44 @@ bool ManualMapInject(DWORD pid, const std::string& dllPath) {
         return false;
     }
 
-    HANDLE hProc = OpenProcess(
-        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
-        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION,
-        FALSE, pid);
-
+    StatusMsg("[*] Opening process via NtOpenProcess...");
+    HANDLE hProc = NtOpenProc(pid);
     if (!hProc) {
-        StatusMsg("[-] OpenProcess failed: " + std::to_string(GetLastError()));
+        StatusMsg("[-] NtOpenProcess failed: " + std::to_string(GetLastError()));
         return false;
     }
 
     SIZE_T imageSize = pNtH->OptionalHeader.SizeOfImage;
-    LPVOID pTargetBase = VirtualAllocEx(hProc, nullptr, imageSize,
+    PVOID pTargetBase = nullptr;
+
+    NTSTATUS ntStatus = g_Nt.NtAllocateVirtualMemory(
+        hProc, &pTargetBase, 0, &imageSize,
         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
-    if (!pTargetBase) {
-        DWORD err = GetLastError();
-        CloseHandle(hProc);
-        StatusMsg("[-] VirtualAllocEx failed: " + std::to_string(err));
-        return false;
+    if (ntStatus != 0 || !pTargetBase) {
+        pTargetBase = VirtualAllocEx(hProc, nullptr, imageSize,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+        if (!pTargetBase) {
+            DWORD err = GetLastError();
+            CloseHandle(hProc);
+            StatusMsg("[-] VirtualAllocEx failed: " + std::to_string(err));
+            return false;
+        }
     }
 
-    StatusMsg("[*] Allocated " + std::to_string(imageSize) + " bytes at remote base...");
+    StatusMsg("[*] Allocated " + std::to_string(imageSize) + " bytes, mapping sections...");
 
-    if (!WriteProcessMemory(hProc, pTargetBase, rawDll.data(),
-        pNtH->OptionalHeader.SizeOfHeaders, nullptr)) {
-        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        StatusMsg("[-] WriteProcessMemory (headers) failed!");
-        return false;
-    }
+    g_Nt.NtWriteVirtualMemory(hProc, pTargetBase, rawDll.data(),
+        pNtH->OptionalHeader.SizeOfHeaders, nullptr);
 
     auto pSectionH = IMAGE_FIRST_SECTION(pNtH);
     for (WORD i = 0; i < pNtH->FileHeader.NumberOfSections; i++, pSectionH++) {
         if (pSectionH->SizeOfRawData == 0) continue;
-
-        if (!WriteProcessMemory(hProc,
+        g_Nt.NtWriteVirtualMemory(hProc,
             static_cast<BYTE*>(pTargetBase) + pSectionH->VirtualAddress,
             rawDll.data() + pSectionH->PointerToRawData,
-            pSectionH->SizeOfRawData, nullptr))
-        {
-            VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-            CloseHandle(hProc);
-            StatusMsg("[-] WriteProcessMemory (section) failed!");
-            return false;
-        }
+            pSectionH->SizeOfRawData, nullptr);
     }
 
     ManualMapData mapData{};
@@ -232,55 +315,73 @@ bool ManualMapInject(DWORD pid, const std::string& dllPath) {
     SIZE_T shellSize = reinterpret_cast<BYTE*>(ShellCodeEnd) - reinterpret_cast<BYTE*>(ShellCode);
     SIZE_T totalAlloc = shellSize + sizeof(ManualMapData) + 64;
 
-    LPVOID pShellMem = VirtualAllocEx(hProc, nullptr, totalAlloc,
+    PVOID pShellMem = nullptr;
+    ntStatus = g_Nt.NtAllocateVirtualMemory(hProc, &pShellMem, 0, &totalAlloc,
         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
-    if (!pShellMem) {
-        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        StatusMsg("[-] VirtualAllocEx (shellcode) failed: " + std::to_string(GetLastError()));
-        return false;
+    if (ntStatus != 0 || !pShellMem) {
+        pShellMem = VirtualAllocEx(hProc, nullptr, totalAlloc,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!pShellMem) {
+            CloseHandle(hProc);
+            StatusMsg("[-] VirtualAllocEx (shellcode) failed!");
+            return false;
+        }
     }
 
     BYTE* pDataRemote = static_cast<BYTE*>(pShellMem) + shellSize + 16;
 
-    if (!WriteProcessMemory(hProc, pShellMem, ShellCode, shellSize, nullptr)) {
-        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-        VirtualFreeEx(hProc, pShellMem, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        StatusMsg("[-] WriteProcessMemory (shellcode) failed!");
-        return false;
+    g_Nt.NtWriteVirtualMemory(hProc, pShellMem, ShellCode, shellSize, nullptr);
+    g_Nt.NtWriteVirtualMemory(hProc, pDataRemote, &mapData, sizeof(mapData), nullptr);
+
+    StatusMsg("[*] Executing shellcode...");
+
+    HANDLE hThread = nullptr;
+    ntStatus = g_Nt.NtCreateThreadEx(
+        &hThread, THREAD_ALL_ACCESS, nullptr, hProc,
+        pShellMem, pDataRemote,
+        0, 0, 0, 0, nullptr);
+
+    if (ntStatus != 0 || !hThread) {
+        hThread = CreateRemoteThread(hProc, nullptr, 0,
+            reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellMem),
+            pDataRemote, 0, nullptr);
+
+        if (!hThread) {
+            CloseHandle(hProc);
+            StatusMsg("[-] Thread creation failed: " + std::to_string(GetLastError()));
+            return false;
+        }
     }
 
-    if (!WriteProcessMemory(hProc, pDataRemote, &mapData, sizeof(mapData), nullptr)) {
-        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-        VirtualFreeEx(hProc, pShellMem, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        StatusMsg("[-] WriteProcessMemory (data) failed!");
-        return false;
-    }
-
-    HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0,
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellMem),
-        pDataRemote, 0, nullptr);
-
-    if (!hThread) {
-        DWORD err = GetLastError();
-        VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-        VirtualFreeEx(hProc, pShellMem, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        StatusMsg("[-] CreateRemoteThread failed: " + std::to_string(err));
-        return false;
-    }
-
-    WaitForSingleObject(hThread, 10000);
+    WaitForSingleObject(hThread, 15000);
     CloseHandle(hThread);
-
-    VirtualFreeEx(hProc, pShellMem, 0, MEM_RELEASE);
     CloseHandle(hProc);
 
     StatusMsg("[+] ManualMap injection successful!");
     return true;
+}
+
+void WatchAndInject(const std::string& dllPath) {
+    StatusMsg("[*] Watching for PUBG process... Launch the game now!");
+    g_Watching = true;
+
+    std::thread([dllPath]() {
+        while (g_Watching) {
+            DWORD pid = FindProcess(L"TslGame-Win64-Shipping.exe");
+            if (!pid) pid = FindProcess(L"TslGame.exe");
+
+            if (pid) {
+                Sleep(500);
+                StatusMsg("[*] Process found! PID: " + std::to_string(pid) + " Injecting...");
+                EnableDebugPrivilege();
+                ManualMapInject(pid, dllPath);
+                g_Watching = false;
+                return;
+            }
+            Sleep(50);
+        }
+    }).detach();
 }
 
 void RefreshProcessList() {
@@ -319,18 +420,31 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (LOWORD(wParam) == 2) {
             DWORD pid = FindProcess(L"TslGame-Win64-Shipping.exe");
             if (!pid) pid = FindProcess(L"TslGame.exe");
-            if (!pid) { StatusMsg("[-] PUBG not found!"); return 0; }
+            if (!pid) { StatusMsg("[-] PUBG not found! Use Watch & Inject."); return 0; }
             char pathBuf[MAX_PATH]{};
             GetWindowTextA(g_hDllPath, pathBuf, MAX_PATH);
             g_DllPath = pathBuf;
-            StatusMsg("[*] Enabling SeDebugPrivilege...");
-            if (!EnableDebugPrivilege())
-                StatusMsg("[!] SeDebugPrivilege failed, trying anyway...");
+            EnableDebugPrivilege();
             StatusMsg("[*] ManualMap injecting into PID: " + std::to_string(pid));
             ManualMapInject(pid, g_DllPath);
         }
         else if (LOWORD(wParam) == 3) {
             RefreshProcessList();
+        }
+        else if (LOWORD(wParam) == 4) {
+            if (g_Watching) {
+                g_Watching = false;
+                StatusMsg("[*] Watch stopped.");
+            } else {
+                char pathBuf[MAX_PATH]{};
+                GetWindowTextA(g_hDllPath, pathBuf, MAX_PATH);
+                g_DllPath = pathBuf;
+                if (g_DllPath.empty()) {
+                    StatusMsg("[-] Select DLL first!");
+                    return 0;
+                }
+                WatchAndInject(g_DllPath);
+            }
         }
         break;
 
@@ -358,6 +472,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 1;
     }
     case WM_DESTROY:
+        g_Watching = false;
         PostQuitMessage(0);
         break;
     }
@@ -366,6 +481,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     EnableDebugPrivilege();
+    g_Nt.Init();
 
     WNDCLASSEXA wc{};
     wc.cbSize        = sizeof(wc);
@@ -379,7 +495,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     g_hWnd = CreateWindowExA(0, "PubgCheatLauncher", "PUBG Cheat Launcher",
         WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 480, 500,
+        CW_USEDEFAULT, CW_USEDEFAULT, 480, 540,
         nullptr, nullptr, hInst, nullptr);
 
     HFONT hFont = CreateFontA(16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
@@ -408,19 +524,26 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     g_hProcessList = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", "",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY,
-        10, 75, 442, 290, g_hWnd, nullptr, hInst, nullptr);
+        10, 75, 442, 280, g_hWnd, nullptr, hInst, nullptr);
     SendMessage(g_hProcessList, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     g_hStatus = CreateWindowExA(WS_EX_CLIENTEDGE, "STATIC",
-        "[*] Ready. Run as Admin. Select DLL and click Inject.",
-        WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 375, 442, 40, g_hWnd, nullptr, hInst, nullptr);
+        "[*] Run as Admin. Select DLL. Use Watch & Inject for best results.",
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 365, 442, 40, g_hWnd, nullptr, hInst, nullptr);
     SendMessage(g_hStatus, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    g_hInjectBtn = CreateWindowExA(0, "BUTTON", "INJECT (ManualMap)",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 110, 422, 240, 36, g_hWnd, (HMENU)2, hInst, nullptr);
-    HFONT hBigFont = CreateFontA(18, 0, 0, 0, FW_BOLD, 0, 0, 0,
+    HFONT hBigFont = CreateFontA(16, 0, 0, 0, FW_BOLD, 0, 0, 0,
         DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+
+    g_hInjectBtn = CreateWindowExA(0, "BUTTON", "INJECT NOW",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 415, 210, 36, g_hWnd, (HMENU)2, hInst, nullptr);
     SendMessage(g_hInjectBtn, WM_SETFONT, (WPARAM)hBigFont, TRUE);
+
+    g_hWatchBtn = CreateWindowExA(0, "BUTTON", "WATCH & INJECT",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 230, 415, 222, 36, g_hWnd, (HMENU)4, hInst, nullptr);
+    SendMessage(g_hWatchBtn, WM_SETFONT, (WPARAM)hBigFont, TRUE);
+
+    MakeLabel("Tip: Click Watch & Inject BEFORE launching PUBG", 10, 460, 440, 22);
 
     RefreshProcessList();
     ShowWindow(g_hWnd, SW_SHOW);
