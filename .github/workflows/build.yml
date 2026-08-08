@@ -23,29 +23,7 @@ jobs:
     - name: Setup CMake and Ninja
       uses: lukka/get-cmake@latest
 
-    - name: Download ImGui
-      shell: pwsh
-      run: |
-        $imguiVersion = "v1.91.1"
-        Invoke-WebRequest -Uri "https://github.com/ocornut/imgui/archive/refs/tags/$imguiVersion.zip" -OutFile imgui.zip
-        Expand-Archive -Path imgui.zip -DestinationPath .
-        $imguiDir = Get-ChildItem -Directory -Filter "imgui-*" | Select-Object -First 1
-        New-Item -ItemType Directory -Force -Path "Cheat/imgui"
-        # Копируем все заголовки и исходники ImGui
-        Get-ChildItem -Path $imguiDir.FullName -Filter "*.h" | Copy-Item -Destination "Cheat/imgui"
-        Get-ChildItem -Path $imguiDir.FullName -Filter "*.cpp" | Copy-Item -Destination "Cheat/imgui"
-        
-        # Копируем бэкенды DX11 и Win32
-        $backendDir = Join-Path $imguiDir.FullName "backends"
-        Copy-Item (Join-Path $backendDir "imgui_impl_win32.h") "Cheat/imgui"
-        Copy-Item (Join-Path $backendDir "imgui_impl_win32.cpp") "Cheat/imgui"
-        Copy-Item (Join-Path $backendDir "imgui_impl_dx11.h") "Cheat/imgui"
-        Copy-Item (Join-Path $backendDir "imgui_impl_dx11.cpp") "Cheat/imgui"
-        
-        Write-Host "ImGui files copied:"
-        Get-ChildItem "Cheat/imgui"
-
-    - name: Configure CMake (Ninja)
+    - name: Configure CMake
       shell: pwsh
       run: |
         cmake -B build -S . -G "Ninja" -DCMAKE_BUILD_TYPE=Release

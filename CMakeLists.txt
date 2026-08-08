@@ -1,13 +1,63 @@
-cmake_minimum_required(VERSION 3.22)
-project(PubgCheat CXX)
+cmake_minimum_required(VERSION 3.20)
+project(PubgCheat LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Windows only
-if(NOT WIN32)
-    message(FATAL_ERROR "Windows only project")
+add_library(cheat SHARED
+    Cheat/main.cpp
+    Cheat/UI.cpp
+    Cheat/Drawing.cpp
+    Cheat/ImGui/imgui.cpp
+    Cheat/ImGui/imgui_draw.cpp
+    Cheat/ImGui/imgui_tables.cpp
+    Cheat/ImGui/imgui_widgets.cpp
+    Cheat/ImGui/imgui_impl_dx11.cpp
+    Cheat/ImGui/imgui_impl_win32.cpp
+)
+
+target_include_directories(cheat PRIVATE
+    ${CMAKE_SOURCE_DIR}/Cheat
+    ${CMAKE_SOURCE_DIR}/Cheat/ImGui
+)
+
+target_compile_definitions(cheat PRIVATE
+    _WINDLL
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+target_link_libraries(cheat PRIVATE
+    d3d11
+    dxgi
+    d3dcompiler
+    dwmapi
+)
+
+if(MSVC)
+    target_compile_options(cheat PRIVATE /W3 /O2 /EHsc /MT /GS-)
 endif()
 
-add_subdirectory(Injector)
-add_subdirectory(Cheat)
+add_executable(Injector WIN32
+    Injector/main.cpp
+)
+
+target_compile_definitions(Injector PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+target_link_libraries(Injector PRIVATE
+    comdlg32
+    shell32
+)
+
+if(MSVC)
+    target_compile_options(Injector PRIVATE /W3 /O2 /EHsc /MT /std:c++17)
+endif()
