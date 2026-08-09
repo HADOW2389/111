@@ -1,4 +1,4 @@
-﻿#include "Types.h"
+#include "Types.h"
 #include "DriverUtil.h"
 #include "Hooks.h"
 
@@ -32,10 +32,22 @@ NTSTATUS DriverEntry(
     _In_ PUNICODE_STRING RegistryPath
 )
 {
-    DriverObject->MajorFunction[IRP_MJ_CLOSE] = &TdDeviceClose;
-    DriverObject->DriverUnload = &TdDeviceUnload;
+    UNREFERENCED_PARAMETER(RegistryPath);
 
-    PsSetLoadImageNotifyRoutine(&LoadImageNotifyRoutine);
-	DBG_PRINT("Installed ImageNotifyRoutine... 0x%p", &LoadImageNotifyRoutine);
+    if (DriverObject)
+    {
+        DriverObject->MajorFunction[IRP_MJ_CLOSE] = &TdDeviceClose;
+        DriverObject->DriverUnload = &TdDeviceUnload;
+    }
+
+    NTSTATUS status = PsSetLoadImageNotifyRoutine(&LoadImageNotifyRoutine);
+    if (NT_SUCCESS(status))
+    {
+        DBG_PRINT("Installed ImageNotifyRoutine... 0x%p", &LoadImageNotifyRoutine);
+    }
+    else
+    {
+        DBG_PRINT("Failed to install ImageNotifyRoutine: 0x%08X", status);
+    }
     return STATUS_SUCCESS;
 }
