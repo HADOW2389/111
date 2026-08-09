@@ -2,23 +2,12 @@
 
 namespace DriverUtil
 {
-    // This function was created with help from wlan
-    //
-    // Links to his work: 
-    // https://github.com/not-wlan/driver-hijack
-    // https://www.unknowncheats.me/forum/c-and-c-/274073-iterating-driver_objects.html
-    // https://www.unknowncheats.me/forum/anti-cheat-bypass/274881-memedriver-driver-object-hijack-poc.html
-
     PDRIVER_OBJECT GetDriverObject(PUNICODE_STRING lpDriverName)
     {
         HANDLE handle{};
         OBJECT_ATTRIBUTES attributes{};
         UNICODE_STRING directory_name{};
         PVOID directory{};
-        BOOLEAN success = FALSE;
-        FAST_IO_DISPATCH fastIoDispatch;
-        bool installedHook = false;
-        RtlZeroMemory(&fastIoDispatch, sizeof(FAST_IO_DISPATCH));
         RtlInitUnicodeString(&directory_name, L"\\Driver");
         InitializeObjectAttributes(
             &attributes,
@@ -28,7 +17,6 @@ namespace DriverUtil
             NULL
         );
 
-        // open OBJECT_DIRECTORY for \\Driver
         auto status = ZwOpenDirectoryObject(
             &handle,
             DIRECTORY_ALL_ACCESS,
@@ -37,11 +25,10 @@ namespace DriverUtil
 
         if (!NT_SUCCESS(status))
         {
-            DBG_PRINT("ZwOpenDirectoryObject Failed");
+            DBG_PRINT("GetDriverObject: ZwOpenDirectoryObject Failed");
             return NULL;
         }
 
-        // Get OBJECT_DIRECTORY pointer from HANDLE
         status = ObReferenceObjectByHandle(
             handle,
             DIRECTORY_ALL_ACCESS,
@@ -53,42 +40,57 @@ namespace DriverUtil
 
         if (!NT_SUCCESS(status))
         {
-            DBG_PRINT("ObReferenceObjectByHandle Failed");
+            DBG_PRINT("GetDriverObject: ObReferenceObjectByHandle Failed");
             ZwClose(handle);
             return NULL;
         }
 
         const auto directory_object = POBJECT_DIRECTORY(directory);
         if (!directory_object)
+        {
+            ObDereferenceObject(directory);
+            ZwClose(handle);
             return NULL;
+        }
 
         ExAcquirePushLockExclusiveEx(&directory_object->Lock, 0);
 
-        // traverse hash table with 37 entries
-        // when a new object is created, the object manager computes a hash value in the range zero to 36 from the object name and creates an OBJECT_DIRECTORY_ENTRY.    
-        // http://www.informit.com/articles/article.aspx?p=22443&seqNum=7
-        for (auto entry : directory_object->HashBuckets)
+        PDRIVER_OBJECT foundDriver = NULL;
+
+        // Fix #7: Traverse hash table correctly with ChainLink
+        for (int bucket = 0; bucket < 37; bucket++)
         {
-            if (!entry)
-                continue;
-
-            while (entry && entry->Object)
+            POBJECT_DIRECTORY_ENTRY entry = directory_object->HashBuckets[bucket];
+            
+            // Fix #6: Properly advance through linked list using ChainLink
+            while (entry)
             {
-                auto driver = PDRIVER_OBJECT(entry->Object);
-                if (!driver)
-                    continue;
-
-                if (wcscmp(driver->DriverExtension->ServiceKeyName.Buffer, lpDriverName->Buffer) == 0)
-                    return driver;
+                if (entry->Object)
+                {
+                    auto driver = PDRIVER_OBJECT(entry->Object);
+                    if (driver && driver->DriverExtension)
+                    {
+                        if (wcscmp(driver->DriverExtension->ServiceKeyName.Buffer, lpDriverName->Buffer) == 0)
+                        {
+                            foundDriver = driver;
+                            break; // Found it, exit inner loop
+                        }
+                    }
+                }
+                // Fix #6: Advance to next entry (THIS WAS MISSING)
+                entry = entry->ChainLink;
             }
+            
+            if (foundDriver)
+                break;
         }
 
+        // Fix #7: Always release the lock (even on early return)
         ExReleasePushLockExclusiveEx(&directory_object->Lock, 0);
-        // Release the acquired resources back to the OS
         ObDereferenceObject(directory);
         ZwClose(handle);
-        //TODO remove
-        return NULL;
+        
+        return foundDriver;
     }
 
     PVOID GetDriverBase(LPCSTR module_name)
@@ -121,13 +123,12 @@ namespace DriverUtil
             }
             
             PRTL_PROCESS_MODULE_INFORMATION module = modules->Modules;
-            PVOID module_base{}, module_size{};
+            PVOID module_base{};
             for (ULONG i = 0; i < modules->NumberOfModules; i++)
             {
                 if (strcmp(reinterpret_cast<char*>(module[i].FullPathName + module[i].OffsetToFileName), module_name) == 0)
                 {
                     module_base = module[i].ImageBase;
-                    module_size = (PVOID)module[i].ImageSize;
                     break;
                 }
             }
@@ -183,7 +184,6 @@ namespace DriverUtil
                     functionName = (PIMAGE_IMPORT_BY_NAME)((DWORD_PTR)lpBaseAddress + originalFirstThunk->u1.AddressOfData);
                     if (strcmp(functionName->Name, lpcStrImport) == 0)
                     {
-                        // save old function pointer
                         result = reinterpret_cast<PVOID>(firstThunk->u1.Function);
                         ULONG64 newFunc = reinterpret_cast<ULONG64>(lpFuncAddress);
                         if (Memory::SafeWriteMemory(&firstThunk->u1.Function, &newFunc, sizeof(ULONG64)))
