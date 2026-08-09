@@ -34,7 +34,6 @@ namespace ShieldDriver {
     HANDLE  Open();
     void    Close(HANDLE hDevice);
 
-    bool    KernelMemcpy(HANDLE hDevice, uint64_t dest, uint64_t src, uint64_t size);
     bool    ReadKernel(HANDLE hDevice, uint64_t kernelAddr, void* userBuf, uint64_t size);
     bool    WriteKernel(HANDLE hDevice, uint64_t kernelAddr, const void* userBuf, uint64_t size);
 
