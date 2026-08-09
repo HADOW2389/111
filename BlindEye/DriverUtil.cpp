@@ -185,11 +185,12 @@ namespace DriverUtil
                     {
                         // save old function pointer
                         result = reinterpret_cast<PVOID>(firstThunk->u1.Function);
-                        Memory::WriteProtectOff();
-                        // swap address
-                        firstThunk->u1.Function = reinterpret_cast<ULONG64>(lpFuncAddress);
-                        Memory::WriteProtectOn();
-                        return result;
+                        ULONG64 newFunc = reinterpret_cast<ULONG64>(lpFuncAddress);
+                        if (Memory::SafeWriteMemory(&firstThunk->u1.Function, &newFunc, sizeof(ULONG64)))
+                        {
+                            return result;
+                        }
+                        return NULL;
                     }
                     ++originalFirstThunk;
                     ++firstThunk;
