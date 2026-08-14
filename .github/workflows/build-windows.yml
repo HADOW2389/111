@@ -33,7 +33,10 @@ jobs:
           npm run build
 
       - name: Build Rust applications
-        run: cargo build --release --workspace
+        shell: pwsh
+        run: |
+          $env:LIB = "${{ github.workspace }}\lib\windows\amd64;$env:LIB"
+          cargo build --release --workspace
 
       - name: Collect portable files
         shell: pwsh
@@ -41,6 +44,7 @@ jobs:
           New-Item -ItemType Directory -Path artifact -Force | Out-Null
           Copy-Item target/release/jarvis-app.exe artifact/
           Copy-Item target/release/jarvis-gui.exe artifact/
+          Copy-Item lib/windows/amd64/*.dll artifact/
           Copy-Item resources artifact/resources -Recurse
 
       - uses: actions/upload-artifact@v4
