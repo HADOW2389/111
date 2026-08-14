@@ -1,0 +1,50 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Rust applications
+        run: cargo build --release --workspace
+
+      - name: Collect portable files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifact -Force | Out-Null
+          Copy-Item target/release/jarvis-app.exe artifact/
+          Copy-Item target/release/jarvis-gui.exe artifact/
+          Copy-Item resources artifact/resources -Recurse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-windows-x64
+          path: artifact
+          if-no-files-found: error
