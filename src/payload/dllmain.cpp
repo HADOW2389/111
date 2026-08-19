@@ -273,6 +273,62 @@ static void InstallLLHook() {
     }
 }
 
+// -------- LdrRegisterDllNotification: catch loader-lock-held loads --------
+//
+// ntdll fires this synchronously while the loader lock is held, right after
+// LdrpMapDll but before the DLL is exposed to the caller. That means we can
+// install the MinHook trampoline in-place before Wry even sees the module.
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING_T, *PUNICODE_STRING_T;
+
+typedef struct _LDR_DLL_LOADED_NOTIFICATION_DATA {
+    ULONG                   Flags;
+    const UNICODE_STRING_T* FullDllName;
+    const UNICODE_STRING_T* BaseDllName;
+    PVOID                   DllBase;
+    ULONG                   SizeOfImage;
+} LDR_DLL_LOADED_NOTIFICATION_DATA_T, *PLDR_DLL_LOADED_NOTIFICATION_DATA_T;
+
+typedef union _LDR_DLL_NOTIFICATION_DATA {
+    LDR_DLL_LOADED_NOTIFICATION_DATA_T Loaded;
+    LDR_DLL_LOADED_NOTIFICATION_DATA_T Unloaded;
+} LDR_DLL_NOTIFICATION_DATA_T, *PLDR_DLL_NOTIFICATION_DATA_T;
+
+typedef VOID (CALLBACK *LDR_DLL_NOTIFICATION_FN)(ULONG, PLDR_DLL_NOTIFICATION_DATA_T, PVOID);
+typedef NTSTATUS (NTAPI *fn_LdrRegisterDllNotification)(ULONG, LDR_DLL_NOTIFICATION_FN, PVOID, PVOID*);
+
+static PVOID g_ldrCookie = nullptr;
+
+static VOID CALLBACK DllNotifyCB(ULONG reason, PLDR_DLL_NOTIFICATION_DATA_T data, PVOID) {
+    if (reason != 1 /*LDR_DLL_NOTIFICATION_REASON_LOADED*/) return;
+    if (!data || !data->Loaded.BaseDllName || !data->Loaded.BaseDllName->Buffer) return;
+    const wchar_t* name = data->Loaded.BaseDllName->Buffer;
+    USHORT clen = data->Loaded.BaseDllName->Length / sizeof(wchar_t);
+    // BaseDllName may not be nul-terminated; compare case-insensitive up to clen.
+    auto matches = [&](const wchar_t* pat) {
+        USHORT plen = (USHORT)lstrlenW(pat);
+        if (clen != plen) return false;
+        return _wcsnicmp(name, pat, clen) == 0;
+    };
+    if (matches(L"EmbeddedBrowserWebView.dll") || matches(L"WebView2Loader.dll")) {
+        Log("LdrNotify: %.*ls loaded @ %p", (int)clen, name, data->Loaded.DllBase);
+        TryHookLoader((HMODULE)data->Loaded.DllBase);
+    }
+}
+
+static void InstallLdrNotification() {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    auto reg = reinterpret_cast<fn_LdrRegisterDllNotification>(
+        GetProcAddress(ntdll, "LdrRegisterDllNotification"));
+    if (!reg) { Log("LdrRegisterDllNotification not found"); return; }
+    NTSTATUS s = reg(0, DllNotifyCB, nullptr, &g_ldrCookie);
+    Log("LdrRegisterDllNotification status=0x%08x cookie=%p", (unsigned)s, g_ldrCookie);
+}
+
 // -------- Init thread --------
 static DWORD WINAPI InitThread(LPVOID) {
     Log("payload init thread starting");
@@ -320,6 +376,19 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hInst);
         wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         Log("payload attached to %ls", exe);
+
+        // Register the loader notification synchronously so we hook the DLL the
+        // instant ntdll finishes mapping it — before Wry can call it.
+        InstallLdrNotification();
+
+        // If the loader is already in the process (unlikely but possible if we
+        // were injected late) hook it right here without waiting for the thread.
+        HMODULE m = GetModuleHandleW(L"EmbeddedBrowserWebView.dll");
+        if (!m) m = GetModuleHandleW(L"WebView2Loader.dll");
+        if (m) TryHookLoader(m);
+
+        // Init thread does the LoadLibraryEx hook + fallback polling. If the
+        // notification path fires first, the thread just exits early.
         CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
     }
     return TRUE;
