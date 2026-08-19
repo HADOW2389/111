@@ -220,39 +220,43 @@ static void DumpModuleExports(HMODULE m, const char* tag) {
 
 static bool TryHookLoader(HMODULE m) {
     if (g_hooked.load()) return true;
-    MH_STATUS s = MH_Initialize();
-    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { Log("MH_Initialize failed %d", (int)s); return false; }
-
-    // Diagnostics: publish handle and dump the full export set once.
+    // Publish handle for GPA logging as early as possible.
     g_ebwHandle = m;
     g_loaderHandle = m;
-    DumpModuleExports(m, "EBW/loader");
 
-    // Standard entry point (present in WebView2Loader.dll).
+    MH_STATUS s = MH_Initialize();
+    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) return false;
+
+    // Race-critical: install the hook BEFORE any logging or diagnostics.
+    // Wry can call GetProcAddress + invoke within microseconds of Ldr notify
+    // firing, so anything we do before the trampoline is live is a risk.
+    void* target = nullptr;
+    void* detour = nullptr;
+    void** trampSlot = nullptr;
+    const char* which = nullptr;
+
     if (auto p = GetProcAddress(m, "CreateCoreWebView2EnvironmentWithOptions")) {
-        if (MH_CreateHook(reinterpret_cast<void*>(p), reinterpret_cast<void*>(&HookedCreateEnv),
-                          reinterpret_cast<void**>(&g_origCreateEnv)) == MH_OK
-            && MH_EnableHook(reinterpret_cast<void*>(p)) == MH_OK) {
-            g_hooked = true;
-            Log("HOOK LIVE: CreateCoreWebView2EnvironmentWithOptions @%p in module %p", p, m);
-            return true;
-        }
-        Log("MinHook failed on CreateCoreWebView2EnvironmentWithOptions");
+        target = reinterpret_cast<void*>(p);
+        detour = reinterpret_cast<void*>(&HookedCreateEnv);
+        trampSlot = reinterpret_cast<void**>(&g_origCreateEnv);
+        which = "CreateCoreWebView2EnvironmentWithOptions";
+    } else if (auto p2 = GetProcAddress(m, "CreateWebViewEnvironmentWithOptionsInternal")) {
+        target = reinterpret_cast<void*>(p2);
+        detour = reinterpret_cast<void*>(&HookedCreateEnvInternal);
+        trampSlot = reinterpret_cast<void**>(&g_origCreateEnvInternal);
+        which = "CreateWebViewEnvironmentWithOptionsInternal";
     }
 
-    // Internal entry point (EmbeddedBrowserWebView.dll — Volt's SxS path).
-    if (auto p = GetProcAddress(m, "CreateWebViewEnvironmentWithOptionsInternal")) {
-        if (MH_CreateHook(reinterpret_cast<void*>(p), reinterpret_cast<void*>(&HookedCreateEnvInternal),
-                          reinterpret_cast<void**>(&g_origCreateEnvInternal)) == MH_OK
-            && MH_EnableHook(reinterpret_cast<void*>(p)) == MH_OK) {
-            g_hooked = true;
-            Log("HOOK LIVE: CreateWebViewEnvironmentWithOptionsInternal @%p in module %p", p, m);
-            return true;
-        }
-        Log("MinHook failed on CreateWebViewEnvironmentWithOptionsInternal");
-    }
+    if (!target) return false;
 
-    return false;
+    if (MH_CreateHook(target, detour, trampSlot) != MH_OK) return false;
+    if (MH_EnableHook(target) != MH_OK) return false;
+    g_hooked = true;
+
+    // Hook is live — safe to log now.
+    Log("HOOK LIVE: %s @%p in module %p", which, target, m);
+    DumpModuleExports(m, "EBW/loader");
+    return true;
 }
 
 static HMODULE FindWebViewLoader() {
@@ -373,12 +377,18 @@ static VOID CALLBACK DllNotifyCB(ULONG reason, PLDR_DLL_NOTIFICATION_DATA_T data
     wchar_t name[MAX_PATH]; if (clen >= MAX_PATH) clen = MAX_PATH - 1;
     memcpy(name, raw, clen * sizeof(wchar_t)); name[clen] = 0;
 
-    // Log every load so we can trace ordering.
-    Log("LdrNotify LOADED: %ls @ %p sz=%lu", name, data->Loaded.DllBase, data->Loaded.SizeOfImage);
-
-    if (_wcsicmp(name, L"EmbeddedBrowserWebView.dll") == 0
-        || _wcsicmp(name, L"WebView2Loader.dll") == 0) {
+    // Race-critical path: match target modules FIRST, before any logging.
+    // Every Log() call is a CreateFileA + WriteFile + CloseHandle round trip
+    // (multiple ms) which is enough time for Wry to GetProcAddress + call.
+    bool isTarget = (_wcsicmp(name, L"EmbeddedBrowserWebView.dll") == 0
+                     || _wcsicmp(name, L"WebView2Loader.dll") == 0);
+    if (isTarget) {
         TryHookLoader((HMODULE)data->Loaded.DllBase);
+    }
+    // Non-target modules get logged only if we haven't hooked yet, to keep
+    // the trace useful without spamming after the hook is live.
+    if (!g_hooked.load()) {
+        Log("LdrNotify LOADED: %ls @ %p", name, data->Loaded.DllBase);
     }
 }
 
