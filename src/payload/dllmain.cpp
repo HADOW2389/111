@@ -55,6 +55,21 @@ using pfn_CreateEnvOpts = HRESULT (STDMETHODCALLTYPE*)(
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
 static pfn_CreateEnvOpts g_origCreateEnv = nullptr;
 
+// Internal loader export used by Wry when WebView2Loader.dll is bypassed
+// (Volt hits this path via Microsoft.MSEdgeWebView.Loader SxS activation).
+// Signature reverse-engineered from EmbeddedBrowserWebView.dll:
+//   HRESULT WINAPI CreateWebViewEnvironmentWithOptionsInternal(
+//       BOOL installCheckFlag,
+//       LPCWSTR browserExecutableFolder, LPCWSTR userDataFolder,
+//       LPCWSTR additionalBrowserArguments, LPCWSTR additionalClientArguments,
+//       LPCWSTR targetCompatibleBrowserVersion,
+//       BOOL allowSingleSignOnUsingOSPrimaryAccount,
+//       ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* handler);
+using pfn_CreateEnvInternal = HRESULT (WINAPI*)(
+    BOOL, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, BOOL,
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
+static pfn_CreateEnvInternal g_origCreateEnvInternal = nullptr;
+
 using pfn_CreateCtrl = HRESULT (STDMETHODCALLTYPE*)(
     ICoreWebView2Environment*, HWND,
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*);
@@ -152,25 +167,54 @@ static HRESULT STDMETHODCALLTYPE HookedCreateEnv(
     return hr;
 }
 
+static HRESULT WINAPI HookedCreateEnvInternal(
+    BOOL installCheckFlag, LPCWSTR bef, LPCWSTR udf,
+    LPCWSTR addlBrowserArgs, LPCWSTR addlClientArgs,
+    LPCWSTR targetVersion, BOOL allowSSO,
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* handler)
+{
+    Log("CreateWebViewEnvironmentWithOptionsInternal intercepted (bef=%ls udf=%ls target=%ls)",
+        bef ? bef : L"(null)", udf ? udf : L"(null)", targetVersion ? targetVersion : L"(null)");
+    auto wrap = new EnvHandler(handler);
+    HRESULT hr = g_origCreateEnvInternal(installCheckFlag, bef, udf, addlBrowserArgs,
+                                         addlClientArgs, targetVersion, allowSSO, wrap);
+    wrap->Release();
+    return hr;
+}
+
 // -------- Loader discovery --------
 static std::atomic<bool> g_hooked{false};
 
 static bool TryHookLoader(HMODULE m) {
     if (g_hooked.load()) return true;
-    auto p = GetProcAddress(m, "CreateCoreWebView2EnvironmentWithOptions");
-    if (!p) return false;
     MH_STATUS s = MH_Initialize();
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { Log("MH_Initialize failed %d", (int)s); return false; }
-    if (MH_CreateHook(reinterpret_cast<void*>(p), reinterpret_cast<void*>(&HookedCreateEnv),
-                      reinterpret_cast<void**>(&g_origCreateEnv)) != MH_OK) {
-        Log("MH_CreateHook failed on %p", p); return false;
+
+    // Standard entry point (present in WebView2Loader.dll).
+    if (auto p = GetProcAddress(m, "CreateCoreWebView2EnvironmentWithOptions")) {
+        if (MH_CreateHook(reinterpret_cast<void*>(p), reinterpret_cast<void*>(&HookedCreateEnv),
+                          reinterpret_cast<void**>(&g_origCreateEnv)) == MH_OK
+            && MH_EnableHook(reinterpret_cast<void*>(p)) == MH_OK) {
+            g_hooked = true;
+            Log("HOOK LIVE: CreateCoreWebView2EnvironmentWithOptions @%p in module %p", p, m);
+            return true;
+        }
+        Log("MinHook failed on CreateCoreWebView2EnvironmentWithOptions");
     }
-    if (MH_EnableHook(reinterpret_cast<void*>(p)) != MH_OK) {
-        Log("MH_EnableHook failed"); return false;
+
+    // Internal entry point (EmbeddedBrowserWebView.dll — Volt's SxS path).
+    if (auto p = GetProcAddress(m, "CreateWebViewEnvironmentWithOptionsInternal")) {
+        if (MH_CreateHook(reinterpret_cast<void*>(p), reinterpret_cast<void*>(&HookedCreateEnvInternal),
+                          reinterpret_cast<void**>(&g_origCreateEnvInternal)) == MH_OK
+            && MH_EnableHook(reinterpret_cast<void*>(p)) == MH_OK) {
+            g_hooked = true;
+            Log("HOOK LIVE: CreateWebViewEnvironmentWithOptionsInternal @%p in module %p", p, m);
+            return true;
+        }
+        Log("MinHook failed on CreateWebViewEnvironmentWithOptionsInternal");
     }
-    g_hooked = true;
-    Log("HOOK LIVE: CreateCoreWebView2EnvironmentWithOptions @%p in module %p", p, m);
-    return true;
+
+    return false;
 }
 
 static HMODULE FindWebViewLoader() {
@@ -252,15 +296,18 @@ static DWORD WINAPI InitThread(LPVOID) {
 
     InstallLLHook();
 
-    // Poll for the loader (60 s window).
+    // Poll for the loader (60 s window). Track the last-seen module handle so we
+    // don't spam the log with the same candidate every 100 ms.
+    HMODULE lastSeen = nullptr;
     for (int i = 0; i < 600 && !g_hooked.load(); i++) {
         HMODULE m = FindWebViewLoader();
-        if (m) {
+        if (m && m != lastSeen) {
             wchar_t path[MAX_PATH] = {};
             GetModuleFileNameExW(GetCurrentProcess(), m, path, MAX_PATH);
-            Log("loader detected via scan: %ls", path);
-            if (TryHookLoader(m)) break;
+            Log("loader candidate: %ls", path);
+            lastSeen = m;
         }
+        if (m && TryHookLoader(m)) break;
         Sleep(100);
     }
 
