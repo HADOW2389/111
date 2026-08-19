@@ -220,16 +220,13 @@ static void DumpModuleExports(HMODULE m, const char* tag) {
 
 static bool TryHookLoader(HMODULE m) {
     if (g_hooked.load()) return true;
-    // Publish handle for GPA logging as early as possible.
     g_ebwHandle = m;
     g_loaderHandle = m;
 
     MH_STATUS s = MH_Initialize();
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) return false;
 
-    // Race-critical: install the hook BEFORE any logging or diagnostics.
-    // Wry can call GetProcAddress + invoke within microseconds of Ldr notify
-    // firing, so anything we do before the trampoline is live is a risk.
+    // Race-critical: install the hook BEFORE any logging.
     void* target = nullptr;
     void* detour = nullptr;
     void** trampSlot = nullptr;
@@ -253,9 +250,9 @@ static bool TryHookLoader(HMODULE m) {
     if (MH_EnableHook(target) != MH_OK) return false;
     g_hooked = true;
 
-    // Hook is live — safe to log now.
+    // Hook is live — safe to log now. Skip export dump: writing 8 log lines
+    // under loader lock can push Wry past a timeout.
     Log("HOOK LIVE: %s @%p in module %p", which, target, m);
-    DumpModuleExports(m, "EBW/loader");
     return true;
 }
 
@@ -302,23 +299,6 @@ static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR name, HANDLE f, DWORD flags) 
     return m;
 }
 
-// -------- GetProcAddress hook — logs every symbol resolution against the loader --------
-using pfn_GetProcAddress = FARPROC (WINAPI*)(HMODULE, LPCSTR);
-static pfn_GetProcAddress g_origGPA = nullptr;
-
-static FARPROC WINAPI HookedGetProcAddress(HMODULE h, LPCSTR name) {
-    FARPROC r = g_origGPA(h, name);
-    if (h && (h == g_ebwHandle || h == g_loaderHandle)) {
-        // name may be ordinal (low bits) or string pointer
-        if (reinterpret_cast<ULONG_PTR>(name) < 0x10000) {
-            Log("GetProcAddress(EBW/loader, ord#%u) -> %p", (unsigned)(ULONG_PTR)name, r);
-        } else {
-            Log("GetProcAddress(EBW/loader, \"%s\") -> %p", name, r);
-        }
-    }
-    return r;
-}
-
 static void InstallLLHook() {
     MH_STATUS s = MH_Initialize();
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) return;
@@ -331,13 +311,9 @@ static void InstallLLHook() {
             Log("LoadLibraryExW hooked as fallback");
         }
     }
-    if (auto pGPA = GetProcAddress(k32, "GetProcAddress")) {
-        if (MH_CreateHook(reinterpret_cast<void*>(pGPA), reinterpret_cast<void*>(&HookedGetProcAddress),
-                          reinterpret_cast<void**>(&g_origGPA)) == MH_OK) {
-            MH_EnableHook(reinterpret_cast<void*>(pGPA));
-            Log("GetProcAddress hooked for diagnostics");
-        }
-    }
+    // Note: GetProcAddress hook was previously installed here for diagnostics.
+    // It was destabilising Wry (Volt would crash right after opening its window),
+    // so it is intentionally not enabled now.
 }
 
 // -------- LdrRegisterDllNotification: catch loader-lock-held loads --------
@@ -377,18 +353,11 @@ static VOID CALLBACK DllNotifyCB(ULONG reason, PLDR_DLL_NOTIFICATION_DATA_T data
     wchar_t name[MAX_PATH]; if (clen >= MAX_PATH) clen = MAX_PATH - 1;
     memcpy(name, raw, clen * sizeof(wchar_t)); name[clen] = 0;
 
-    // Race-critical path: match target modules FIRST, before any logging.
-    // Every Log() call is a CreateFileA + WriteFile + CloseHandle round trip
-    // (multiple ms) which is enough time for Wry to GetProcAddress + call.
-    bool isTarget = (_wcsicmp(name, L"EmbeddedBrowserWebView.dll") == 0
-                     || _wcsicmp(name, L"WebView2Loader.dll") == 0);
-    if (isTarget) {
+    // Race-critical path: match target modules FIRST. Do NOT log every load
+    // — writing to disk under loader lock can slow Wry init into a timeout.
+    if (_wcsicmp(name, L"EmbeddedBrowserWebView.dll") == 0
+        || _wcsicmp(name, L"WebView2Loader.dll") == 0) {
         TryHookLoader((HMODULE)data->Loaded.DllBase);
-    }
-    // Non-target modules get logged only if we haven't hooked yet, to keep
-    // the trace useful without spamming after the hook is live.
-    if (!g_hooked.load()) {
-        Log("LdrNotify LOADED: %ls @ %p", name, data->Loaded.DllBase);
     }
 }
 
