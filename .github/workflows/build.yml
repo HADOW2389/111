@@ -43,7 +43,7 @@ jobs:
              deps\minhook\src\buffer.c ^
              deps\minhook\src\trampoline.c ^
              deps\minhook\src\hde\hde64.c ^
-             /link /DEF:src\dwmapi.def /OUT:dist\dwmapi.dll ^
+             /link /OUT:dist\dwmapi.dll ^
              ole32.lib oleaut32.lib user32.lib advapi32.lib kernel32.lib shlwapi.lib
           if errorlevel 1 exit /b 1
 

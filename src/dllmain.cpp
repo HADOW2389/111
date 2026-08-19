@@ -36,6 +36,12 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "ole32.lib")
 
+// Forward the 3 dwmapi.dll functions Volt imports to dwmapi_real.dll
+// (a copy of the system dwmapi.dll placed next to us by install.ps1).
+#pragma comment(linker, "/EXPORT:DwmGetWindowAttribute=dwmapi_real.DwmGetWindowAttribute")
+#pragma comment(linker, "/EXPORT:DwmEnableBlurBehindWindow=dwmapi_real.DwmEnableBlurBehindWindow")
+#pragma comment(linker, "/EXPORT:DwmSetWindowAttribute=dwmapi_real.DwmSetWindowAttribute")
+
 static void Log(const char* fmt, ...) {
     char path[MAX_PATH]; GetTempPathA(MAX_PATH, path);
     lstrcatA(path, "volt-bypass.log");
