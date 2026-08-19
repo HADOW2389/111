@@ -18,11 +18,6 @@ jobs:
         with:
           arch: x64
 
-      - name: Fetch MinHook
-        shell: pwsh
-        run: |
-          git clone --depth=1 https://github.com/TsudaKageyu/minhook.git deps/minhook
-
       - name: Fetch WebView2 SDK
         shell: pwsh
         run: |
@@ -30,20 +25,15 @@ jobs:
           Invoke-WebRequest 'https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2792.45' -OutFile deps\wv2.zip
           Expand-Archive -Force deps\wv2.zip -DestinationPath deps\wv2
 
-      - name: Build dwmapi.dll
+      - name: Build WebView2Loader.dll shim
         shell: cmd
         run: |
           if not exist dist mkdir dist
           cl /nologo /std:c++17 /LD /MT /EHsc /O2 /W3 /GS- /permissive- ^
              /DWIN32 /D_WINDOWS /D_USRDLL /DUNICODE /D_UNICODE ^
              /I"deps\wv2\build\native\include" ^
-             /I"deps\minhook\include" ^
              src\dllmain.cpp ^
-             deps\minhook\src\hook.c ^
-             deps\minhook\src\buffer.c ^
-             deps\minhook\src\trampoline.c ^
-             deps\minhook\src\hde\hde64.c ^
-             /link /OUT:dist\dwmapi.dll ^
+             /link /OUT:dist\WebView2Loader.dll ^
              ole32.lib oleaut32.lib user32.lib advapi32.lib kernel32.lib shlwapi.lib
           if errorlevel 1 exit /b 1
 

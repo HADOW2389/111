@@ -1,27 +1,31 @@
-# install.ps1 — deploy dwmapi.dll shim into Volt
-# Run in an elevated PowerShell (or normal — Volt's folder is in AppData\Local, no admin needed).
+# install.ps1 — deploy WebView2Loader.dll shim into Volt.
+# No admin required — target is %LOCALAPPDATA%\Volt.
 $ErrorActionPreference = 'Stop'
 
 $voltDir  = Join-Path $env:LOCALAPPDATA 'Volt'
-$sysDwm   = Join-Path $env:SystemRoot   'System32\dwmapi.dll'
-$dstReal  = Join-Path $voltDir 'dwmapi_real.dll'
-$dstShim  = Join-Path $voltDir 'dwmapi.dll'
-$srcShim  = Join-Path $PSScriptRoot 'dwmapi.dll'
-$logHint  = Join-Path $env:TEMP 'volt-bypass.log'
+$srcShim  = Join-Path $PSScriptRoot     'WebView2Loader.dll'
+$dstShim  = Join-Path $voltDir          'WebView2Loader.dll'
+$logHint  = Join-Path $env:TEMP         'volt-bypass.log'
 
-if (-not (Test-Path $voltDir))    { throw "Volt not installed at $voltDir" }
-if (-not (Test-Path $srcShim))    { throw "Missing shim next to install.ps1: $srcShim" }
-if (-not (Test-Path $sysDwm))     { throw "System dwmapi.dll missing?" }
+# Clean up the previous approach if it's still there.
+Remove-Item -Force (Join-Path $voltDir 'dwmapi.dll')       -ErrorAction SilentlyContinue
+Remove-Item -Force (Join-Path $voltDir 'dwmapi_real.dll')  -ErrorAction SilentlyContinue
 
-# 1) copy system dwmapi.dll into Volt as dwmapi_real.dll (forward target).
-Copy-Item -Force $sysDwm $dstReal
+if (-not (Test-Path $voltDir)) { throw "Volt not installed at $voltDir" }
+if (-not (Test-Path $srcShim)) { throw "Missing shim next to install.ps1: $srcShim" }
 
-# 2) drop our shim.
 Copy-Item -Force $srcShim $dstShim
 
-Write-Host "[OK] installed:"
-Write-Host "     $dstReal"
-Write-Host "     $dstShim"
+Write-Host "[OK] deployed: $dstShim"
 Write-Host ""
-Write-Host "Launch Volt normally. Bypass log will appear at:"
-Write-Host "     $logHint"
+Write-Host "Launch Volt. Bypass log will appear at:"
+Write-Host "  $logHint"
+Write-Host ""
+Write-Host "Expected log lines:"
+Write-Host "  shim attached to tauri-app.exe"
+Write-Host "  EdgeWebView pv=..."
+Write-Host "  real loader: ..."
+Write-Host "  CreateCoreWebView2EnvironmentWithOptions (shim)"
+Write-Host "  EnvironmentCreated hr=0x00000000"
+Write-Host "  v-table patched: CreateCoreWebView2Controller -> hook"
+Write-Host "  preload injected hr=0x00000000"

@@ -1,47 +1,47 @@
-// dwmapi.dll shim for Volt (com.volt.editor / tauri-app.exe).
+// WebView2Loader.dll shim for Volt (com.volt.editor / tauri-app.exe).
 //
-// Strategy:
-//   * We ship a proxy dwmapi.dll next to tauri-app.exe (Volt statically
-//     imports 3 functions from dwmapi.dll — the .def forwards them to
-//     dwmapi_real.dll, a copy of the system dwmapi.dll).
-//   * On DLL_PROCESS_ATTACH we spawn a helper thread that hooks
-//     LoadLibraryExW and polls for WebView2Loader.dll to appear.
-//   * As soon as WebView2Loader.dll is in the process we MinHook
-//     CreateCoreWebView2EnvironmentWithOptions and wrap the environment
-//     callback.
-//   * When the environment is created we v-table patch its
-//     CreateCoreWebView2Controller so every controller callback runs
-//     AddScriptToExecuteOnDocumentCreated(kPreloadJS) before Volt sees
-//     the WebView.
+// Why WebView2Loader.dll and not dwmapi.dll?
+//   * dwmapi is in HKLM\...\Session Manager\KnownDLLs — Windows always
+//     resolves it from System32, never from the exe directory. So our
+//     shim was never loaded.
+//   * WebView2Loader.dll is loaded dynamically by Wry via
+//     LoadLibraryW("WebView2Loader.dll") — the default DLL search order
+//     picks the copy sitting next to tauri-app.exe first.
 //
-// Everything logs to %TEMP%\volt-bypass.log so we can debug from Volt
-// without a debugger attached.
+// What we do:
+//   1. Export the 5 real WebView2Loader.dll entry points so the loader
+//      is a drop-in replacement.
+//   2. On demand, load the actual runtime loader from
+//      C:\Program Files (x86)\Microsoft\EdgeWebView\Application\<ver>\EBWebView\x64\WebView2Loader.dll
+//      (version read from HKLM\...\EdgeUpdate\Clients\{F3017226-...}\pv).
+//   3. For CreateCoreWebView2EnvironmentWithOptions and its basic
+//      sibling: wrap the completion handler so we can v-table patch
+//      ICoreWebView2Environment::CreateCoreWebView2Controller.
+//   4. In the controller-completed callback: call
+//      AddScriptToExecuteOnDocumentCreated(kPreloadJS) before Volt sees
+//      the WebView.
+//   5. All other exports are thin proxies to the real loader.
+//
+// Log lives at %TEMP%\volt-bypass.log.
 
 #include <windows.h>
 #include <psapi.h>
 #include <shlwapi.h>
 #include <atomic>
 #include <cstdio>
+#include <cstdarg>
 #include <cstdint>
-#include <string>
 
 #include <objbase.h>
-#include <wrl/client.h>
-
 #include "WebView2.h"
-#include "MinHook.h"
 #include "preload.h"
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "advapi32.lib")
 
-// Forward the 3 dwmapi.dll functions Volt imports to dwmapi_real.dll
-// (a copy of the system dwmapi.dll placed next to us by install.ps1).
-#pragma comment(linker, "/EXPORT:DwmGetWindowAttribute=dwmapi_real.DwmGetWindowAttribute")
-#pragma comment(linker, "/EXPORT:DwmEnableBlurBehindWindow=dwmapi_real.DwmEnableBlurBehindWindow")
-#pragma comment(linker, "/EXPORT:DwmSetWindowAttribute=dwmapi_real.DwmSetWindowAttribute")
-
+// ---- Log helper ----
 static void Log(const char* fmt, ...) {
     char path[MAX_PATH]; GetTempPathA(MAX_PATH, path);
     lstrcatA(path, "volt-bypass.log");
@@ -60,23 +60,113 @@ static void Log(const char* fmt, ...) {
     CloseHandle(h);
 }
 
-// -------- WebView2 typedefs (avoid pulling WebView2Loader.lib) --------
-using PFN_CreateCoreWebView2EnvironmentWithOptions = HRESULT (STDMETHODCALLTYPE*)(
-    PCWSTR browserExecutableFolder,
-    PCWSTR userDataFolder,
-    ICoreWebView2EnvironmentOptions* environmentOptions,
-    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* environmentCreatedHandler
-);
-static PFN_CreateCoreWebView2EnvironmentWithOptions g_origCreateEnv = nullptr;
-static PFN_CreateCoreWebView2EnvironmentWithOptions g_origCreateEnvVersioned = nullptr;
+// ---- Function signatures for real loader ----
+typedef HRESULT (STDMETHODCALLTYPE *pfn_CreateEnvOpts)(
+    PCWSTR, PCWSTR,
+    ICoreWebView2EnvironmentOptions*,
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
+typedef HRESULT (STDMETHODCALLTYPE *pfn_CreateEnvBasic)(
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
+typedef HRESULT (STDMETHODCALLTYPE *pfn_GetAvail)(PCWSTR, LPWSTR*);
+typedef HRESULT (STDMETHODCALLTYPE *pfn_GetAvailOpts)(
+    PCWSTR, ICoreWebView2EnvironmentOptions*, LPWSTR*);
+typedef HRESULT (STDMETHODCALLTYPE *pfn_CompareVersions)(PCWSTR, PCWSTR, int*);
 
-using PFN_CreateController = HRESULT (STDMETHODCALLTYPE*)(
-    ICoreWebView2Environment*, HWND,
-    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*
-);
-static PFN_CreateController g_origCreateController = nullptr;
+static HMODULE            g_real = nullptr;
+static pfn_CreateEnvOpts  g_pCreateEnvOpts  = nullptr;
+static pfn_CreateEnvBasic g_pCreateEnvBasic = nullptr;
+static pfn_GetAvail       g_pGetAvail       = nullptr;
+static pfn_GetAvailOpts   g_pGetAvailOpts   = nullptr;
+static pfn_CompareVersions g_pCompareVer    = nullptr;
 
-// -------- Controller-completed wrapper --------
+// ---- Locate + load real WebView2Loader.dll ----
+static bool ReadVersion(HKEY root, LPCWSTR sub, wchar_t* out, DWORD cch) {
+    HKEY h; if (RegOpenKeyExW(root, sub, 0, KEY_READ | KEY_WOW64_32KEY, &h) != ERROR_SUCCESS) return false;
+    DWORD type = 0, cb = cch * sizeof(wchar_t);
+    LSTATUS s = RegQueryValueExW(h, L"pv", nullptr, &type, (LPBYTE)out, &cb);
+    RegCloseKey(h);
+    return s == ERROR_SUCCESS && type == REG_SZ && out[0];
+}
+
+static HMODULE LoadRealLoader() {
+    if (g_real) return g_real;
+
+    wchar_t ver[64] = {0};
+    // Try WOW6432Node first (Edge is a 32-bit installer entry)
+    static const wchar_t* kKeys[] = {
+        L"SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+        L"SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+    };
+    for (auto k : kKeys) {
+        if (ReadVersion(HKEY_LOCAL_MACHINE, k, ver, 64)) break;
+    }
+    if (!ver[0]) {
+        for (auto k : kKeys) {
+            if (ReadVersion(HKEY_CURRENT_USER, k, ver, 64)) break;
+        }
+    }
+    Log("EdgeWebView pv=%ls", ver[0] ? ver : L"(none)");
+
+    static const wchar_t* kBases[] = {
+        L"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\%ls\\EBWebView\\x64\\WebView2Loader.dll",
+        L"C:\\Program Files\\Microsoft\\EdgeWebView\\Application\\%ls\\EBWebView\\x64\\WebView2Loader.dll",
+        L"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\%ls\\WebView2Loader.dll",
+        L"C:\\Program Files\\Microsoft\\EdgeWebView\\Application\\%ls\\WebView2Loader.dll",
+    };
+    if (ver[0]) {
+        for (auto b : kBases) {
+            wchar_t path[MAX_PATH];
+            wsprintfW(path, b, ver);
+            g_real = LoadLibraryW(path);
+            if (g_real) {
+                Log("real loader: %ls", path);
+                break;
+            }
+        }
+    }
+
+    // Fallback: search EdgeWebView\Application\* for any WebView2Loader.dll
+    if (!g_real) {
+        static const wchar_t* kSearch[] = {
+            L"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\",
+            L"C:\\Program Files\\Microsoft\\EdgeWebView\\Application\\",
+        };
+        for (auto root : kSearch) {
+            wchar_t glob[MAX_PATH];
+            wsprintfW(glob, L"%ls*", root);
+            WIN32_FIND_DATAW fd;
+            HANDLE hf = FindFirstFileW(glob, &fd);
+            if (hf == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (fd.cFileName[0] == L'.') continue;
+                wchar_t candidate[MAX_PATH];
+                wsprintfW(candidate, L"%ls%ls\\EBWebView\\x64\\WebView2Loader.dll", root, fd.cFileName);
+                g_real = LoadLibraryW(candidate);
+                if (g_real) { Log("real loader (glob): %ls", candidate); break; }
+            } while (FindNextFileW(hf, &fd));
+            FindClose(hf);
+            if (g_real) break;
+        }
+    }
+
+    if (!g_real) {
+        Log("FAILED to locate real WebView2Loader.dll");
+        return nullptr;
+    }
+
+    g_pCreateEnvOpts   = (pfn_CreateEnvOpts)  GetProcAddress(g_real, "CreateCoreWebView2EnvironmentWithOptions");
+    g_pCreateEnvBasic  = (pfn_CreateEnvBasic) GetProcAddress(g_real, "CreateCoreWebView2Environment");
+    g_pGetAvail        = (pfn_GetAvail)       GetProcAddress(g_real, "GetAvailableCoreWebView2BrowserVersionString");
+    g_pGetAvailOpts    = (pfn_GetAvailOpts)   GetProcAddress(g_real, "GetAvailableCoreWebView2BrowserVersionStringWithOptions");
+    g_pCompareVer      = (pfn_CompareVersions)GetProcAddress(g_real, "CompareBrowserVersions");
+
+    Log("resolved: opts=%p basic=%p avail=%p availOpts=%p cmp=%p",
+        g_pCreateEnvOpts, g_pCreateEnvBasic, g_pGetAvail, g_pGetAvailOpts, g_pCompareVer);
+    return g_real;
+}
+
+// ---- Controller-completed wrapper: injects the preload script ----
 class CtrlHandler final : public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler {
     std::atomic<LONG> m_ref{1};
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler* m_orig;
@@ -112,28 +202,31 @@ public:
     }
 };
 
-// -------- v-table hook for ICoreWebView2Environment::CreateCoreWebView2Controller --------
-static HRESULT STDMETHODCALLTYPE HookedCreateController(
+// ---- v-table hook for ICoreWebView2Environment::CreateCoreWebView2Controller ----
+typedef HRESULT (STDMETHODCALLTYPE *pfn_CreateCtrl)(
+    ICoreWebView2Environment*, HWND,
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*);
+static pfn_CreateCtrl g_origCreateCtrl = nullptr;
+
+static HRESULT STDMETHODCALLTYPE HookedCreateCtrl(
     ICoreWebView2Environment* self, HWND parent,
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler* handler)
 {
     Log("CreateCoreWebView2Controller called; wrapping handler");
     CtrlHandler* wrap = new CtrlHandler(handler);
-    HRESULT hr = g_origCreateController(self, parent, wrap);
-    wrap->Release();  // handler released once Invoke fires
+    HRESULT hr = g_origCreateCtrl(self, parent, wrap);
+    wrap->Release();
     return hr;
 }
 
 static void PatchEnvVTable(ICoreWebView2Environment* env) {
-    if (g_origCreateController) return;
+    if (g_origCreateCtrl) return;
     void** vtbl = *reinterpret_cast<void***>(env);
-    // ICoreWebView2Environment method order (from WebView2.h):
-    //   0-2: IUnknown  3: CreateCoreWebView2Controller
-    //   4: CreateWebResourceResponse  5: get_BrowserVersionString ...
-    g_origCreateController = reinterpret_cast<PFN_CreateController>(vtbl[3]);
+    // ICoreWebView2Environment: 0-2 IUnknown, 3 CreateCoreWebView2Controller, ...
+    g_origCreateCtrl = reinterpret_cast<pfn_CreateCtrl>(vtbl[3]);
     DWORD old;
     if (VirtualProtect(&vtbl[3], sizeof(void*), PAGE_READWRITE, &old)) {
-        vtbl[3] = reinterpret_cast<void*>(&HookedCreateController);
+        vtbl[3] = reinterpret_cast<void*>(&HookedCreateCtrl);
         VirtualProtect(&vtbl[3], sizeof(void*), old, &old);
         Log("v-table patched: CreateCoreWebView2Controller -> hook");
     } else {
@@ -141,6 +234,7 @@ static void PatchEnvVTable(ICoreWebView2Environment* env) {
     }
 }
 
+// ---- Environment-created wrapper ----
 class EnvHandler final : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
     std::atomic<LONG> m_ref{1};
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* m_orig;
@@ -167,125 +261,73 @@ public:
     }
 };
 
-// -------- Hooks for CreateCoreWebView2EnvironmentWithOptions (both entry names) --------
-static HRESULT STDMETHODCALLTYPE HookedCreateEnv(
-    PCWSTR bef, PCWSTR udf,
-    ICoreWebView2EnvironmentOptions* opts,
-    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* handler)
+// ---- Exported entry points (drop-in for WebView2Loader.dll) ----
+extern "C" __declspec(dllexport)
+HRESULT STDMETHODCALLTYPE CreateCoreWebView2EnvironmentWithOptions(
+    PCWSTR browserExecutableFolder,
+    PCWSTR userDataFolder,
+    ICoreWebView2EnvironmentOptions* environmentOptions,
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* environmentCreatedHandler)
 {
-    Log("CreateCoreWebView2EnvironmentWithOptions called");
-    EnvHandler* wrap = new EnvHandler(handler);
-    HRESULT hr = g_origCreateEnv(bef, udf, opts, wrap);
+    if (!LoadRealLoader() || !g_pCreateEnvOpts) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+    Log("CreateCoreWebView2EnvironmentWithOptions (shim) bef=%ls udf=%ls",
+        browserExecutableFolder ? browserExecutableFolder : L"(null)",
+        userDataFolder ? userDataFolder : L"(null)");
+    auto wrap = new EnvHandler(environmentCreatedHandler);
+    HRESULT hr = g_pCreateEnvOpts(browserExecutableFolder, userDataFolder, environmentOptions, wrap);
     wrap->Release();
     return hr;
 }
 
-static HRESULT STDMETHODCALLTYPE HookedCreateEnvVersioned(
-    PCWSTR bef, PCWSTR udf,
-    ICoreWebView2EnvironmentOptions* opts,
-    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* handler)
+extern "C" __declspec(dllexport)
+HRESULT STDMETHODCALLTYPE CreateCoreWebView2Environment(
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* environmentCreatedHandler)
 {
-    Log("CreateCoreWebView2EnvironmentWithOptionsInternal called");
-    EnvHandler* wrap = new EnvHandler(handler);
-    HRESULT hr = g_origCreateEnvVersioned(bef, udf, opts, wrap);
+    if (!LoadRealLoader() || !g_pCreateEnvBasic) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+    Log("CreateCoreWebView2Environment (shim)");
+    auto wrap = new EnvHandler(environmentCreatedHandler);
+    HRESULT hr = g_pCreateEnvBasic(wrap);
     wrap->Release();
     return hr;
 }
 
-// -------- Install the WebView2 hook once the loader is present --------
-static std::atomic<bool> g_wv2_hooked{false};
-
-static bool TryInstallWebViewHook(HMODULE loader) {
-    if (g_wv2_hooked.exchange(true)) return true;
-
-    MH_STATUS s = MH_Initialize();
-    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) {
-        Log("MH_Initialize failed %d", (int)s);
-        return false;
-    }
-
-    auto p = GetProcAddress(loader, "CreateCoreWebView2EnvironmentWithOptions");
-    if (p) {
-        if (MH_CreateHook(reinterpret_cast<void*>(p), reinterpret_cast<void*>(&HookedCreateEnv),
-                          reinterpret_cast<void**>(&g_origCreateEnv)) == MH_OK) {
-            MH_EnableHook(reinterpret_cast<void*>(p));
-            Log("hook installed on CreateCoreWebView2EnvironmentWithOptions @%p", (void*)p);
-        }
-    }
-    auto p2 = GetProcAddress(loader, "CreateCoreWebView2EnvironmentWithOptionsInternal");
-    if (p2) {
-        if (MH_CreateHook(reinterpret_cast<void*>(p2), reinterpret_cast<void*>(&HookedCreateEnvVersioned),
-                          reinterpret_cast<void**>(&g_origCreateEnvVersioned)) == MH_OK) {
-            MH_EnableHook(reinterpret_cast<void*>(p2));
-            Log("hook installed on CreateCoreWebView2EnvironmentWithOptionsInternal @%p", (void*)p2);
-        }
-    }
-    return true;
+extern "C" __declspec(dllexport)
+HRESULT STDMETHODCALLTYPE GetAvailableCoreWebView2BrowserVersionString(
+    PCWSTR browserExecutableFolder, LPWSTR* versionInfo)
+{
+    if (!LoadRealLoader() || !g_pGetAvail) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+    return g_pGetAvail(browserExecutableFolder, versionInfo);
 }
 
-// -------- LoadLibrary hook chain (catches WebView2Loader as it loads) --------
-using PFN_LoadLibraryExW = HMODULE (WINAPI*)(LPCWSTR, HANDLE, DWORD);
-static PFN_LoadLibraryExW g_origLoadLibraryExW = nullptr;
-
-static void MaybeHookIfLoader(HMODULE m, const wchar_t* name) {
-    if (!m || !name) return;
-    const wchar_t* leaf = PathFindFileNameW(name);
-    if (_wcsicmp(leaf, L"WebView2Loader.dll") == 0) {
-        Log("WebView2Loader.dll detected via LoadLibrary");
-        TryInstallWebViewHook(m);
-    }
+extern "C" __declspec(dllexport)
+HRESULT STDMETHODCALLTYPE GetAvailableCoreWebView2BrowserVersionStringWithOptions(
+    PCWSTR browserExecutableFolder,
+    ICoreWebView2EnvironmentOptions* environmentOptions,
+    LPWSTR* versionInfo)
+{
+    if (!LoadRealLoader() || !g_pGetAvailOpts) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+    return g_pGetAvailOpts(browserExecutableFolder, environmentOptions, versionInfo);
 }
 
-static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR name, HANDLE f, DWORD flags) {
-    HMODULE m = g_origLoadLibraryExW(name, f, flags);
-    MaybeHookIfLoader(m, name);
-    return m;
+extern "C" __declspec(dllexport)
+HRESULT STDMETHODCALLTYPE CompareBrowserVersions(PCWSTR v1, PCWSTR v2, int* result)
+{
+    if (!LoadRealLoader() || !g_pCompareVer) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+    return g_pCompareVer(v1, v2, result);
 }
 
-// -------- Init thread --------
-static DWORD WINAPI InitThread(LPVOID) {
-    Log("init thread starting");
-
-    // If loader already loaded (unlikely, but check), hook immediately.
-    HMODULE existing = GetModuleHandleW(L"WebView2Loader.dll");
-    if (existing) {
-        TryInstallWebViewHook(existing);
-    }
-
-    // Hook LoadLibraryExW so any future load of the loader is caught.
-    MH_STATUS s = MH_Initialize();
-    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) {
-        Log("MH_Initialize (init) failed %d", (int)s);
-    }
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    auto pLL = k32 ? GetProcAddress(k32, "LoadLibraryExW") : nullptr;
-    if (pLL) {
-        if (MH_CreateHook(reinterpret_cast<void*>(pLL), reinterpret_cast<void*>(&HookedLoadLibraryExW),
-                          reinterpret_cast<void**>(&g_origLoadLibraryExW)) == MH_OK) {
-            MH_EnableHook(reinterpret_cast<void*>(pLL));
-            Log("LoadLibraryExW hooked");
-        }
-    }
-
-    // Belt-and-braces polling: 30s window in case loader appears without LL hook firing.
-    for (int i = 0; i < 300 && !g_wv2_hooked; ++i) {
-        HMODULE m = GetModuleHandleW(L"WebView2Loader.dll");
-        if (m) { TryInstallWebViewHook(m); break; }
-        Sleep(100);
-    }
-    Log("init thread exiting hooked=%d", (int)g_wv2_hooked.load());
-    return 0;
-}
-
+// ---- Entry ----
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hInst);
-        // Only activate inside tauri-app.exe.
         wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         const wchar_t* leaf = PathFindFileNameW(exe);
+        // Only chatter about tauri-app.exe; still function normally in any host
+        // (WebView2Loader.dll is expected to work as a drop-in loader).
         if (_wcsicmp(leaf, L"tauri-app.exe") == 0) {
-            Log("attached to tauri-app.exe (%ls)", exe);
-            CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
+            Log("shim attached to tauri-app.exe (%ls)", exe);
+        } else {
+            Log("shim attached to host %ls", leaf);
         }
     }
     return TRUE;
