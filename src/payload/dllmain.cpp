@@ -70,6 +70,11 @@ using pfn_CreateEnvInternal = HRESULT (WINAPI*)(
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
 static pfn_CreateEnvInternal g_origCreateEnvInternal = nullptr;
 
+// Forward-declared here so TryHookLoader (above InstallLLHook in the file) can
+// stash the handle for the GetProcAddress hook.
+static HMODULE g_ebwHandle = nullptr;
+static HMODULE g_loaderHandle = nullptr;
+
 using pfn_CreateCtrl = HRESULT (STDMETHODCALLTYPE*)(
     ICoreWebView2Environment*, HWND,
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*);
@@ -296,8 +301,6 @@ static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR name, HANDLE f, DWORD flags) 
 // -------- GetProcAddress hook — logs every symbol resolution against the loader --------
 using pfn_GetProcAddress = FARPROC (WINAPI*)(HMODULE, LPCSTR);
 static pfn_GetProcAddress g_origGPA = nullptr;
-static HMODULE g_ebwHandle = nullptr;
-static HMODULE g_loaderHandle = nullptr;
 
 static FARPROC WINAPI HookedGetProcAddress(HMODULE h, LPCSTR name) {
     FARPROC r = g_origGPA(h, name);
