@@ -262,8 +262,15 @@ public:
 };
 
 // ---- Exported entry points (drop-in for WebView2Loader.dll) ----
-extern "C" __declspec(dllexport)
-HRESULT STDMETHODCALLTYPE CreateCoreWebView2EnvironmentWithOptions(
+//
+// WebView2.h already declares the public names via STDAPI (no dllexport),
+// so redefining them causes C2375 "different linkage". Define implementations
+// under unique private names and publish them under the original symbols via
+// linker aliases. x64 has no name decoration for extern "C" __stdcall, so
+// /EXPORT:public=private works directly.
+extern "C" {
+
+HRESULT STDMETHODCALLTYPE WvxCreateEnvOpts(
     PCWSTR browserExecutableFolder,
     PCWSTR userDataFolder,
     ICoreWebView2EnvironmentOptions* environmentOptions,
@@ -279,8 +286,7 @@ HRESULT STDMETHODCALLTYPE CreateCoreWebView2EnvironmentWithOptions(
     return hr;
 }
 
-extern "C" __declspec(dllexport)
-HRESULT STDMETHODCALLTYPE CreateCoreWebView2Environment(
+HRESULT STDMETHODCALLTYPE WvxCreateEnvBasic(
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* environmentCreatedHandler)
 {
     if (!LoadRealLoader() || !g_pCreateEnvBasic) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
@@ -291,16 +297,13 @@ HRESULT STDMETHODCALLTYPE CreateCoreWebView2Environment(
     return hr;
 }
 
-extern "C" __declspec(dllexport)
-HRESULT STDMETHODCALLTYPE GetAvailableCoreWebView2BrowserVersionString(
-    PCWSTR browserExecutableFolder, LPWSTR* versionInfo)
+HRESULT STDMETHODCALLTYPE WvxGetAvail(PCWSTR browserExecutableFolder, LPWSTR* versionInfo)
 {
     if (!LoadRealLoader() || !g_pGetAvail) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
     return g_pGetAvail(browserExecutableFolder, versionInfo);
 }
 
-extern "C" __declspec(dllexport)
-HRESULT STDMETHODCALLTYPE GetAvailableCoreWebView2BrowserVersionStringWithOptions(
+HRESULT STDMETHODCALLTYPE WvxGetAvailOpts(
     PCWSTR browserExecutableFolder,
     ICoreWebView2EnvironmentOptions* environmentOptions,
     LPWSTR* versionInfo)
@@ -309,12 +312,19 @@ HRESULT STDMETHODCALLTYPE GetAvailableCoreWebView2BrowserVersionStringWithOption
     return g_pGetAvailOpts(browserExecutableFolder, environmentOptions, versionInfo);
 }
 
-extern "C" __declspec(dllexport)
-HRESULT STDMETHODCALLTYPE CompareBrowserVersions(PCWSTR v1, PCWSTR v2, int* result)
+HRESULT STDMETHODCALLTYPE WvxCompareBrowserVersions(PCWSTR v1, PCWSTR v2, int* result)
 {
     if (!LoadRealLoader() || !g_pCompareVer) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
     return g_pCompareVer(v1, v2, result);
 }
+
+} // extern "C"
+
+#pragma comment(linker, "/EXPORT:CreateCoreWebView2EnvironmentWithOptions=WvxCreateEnvOpts")
+#pragma comment(linker, "/EXPORT:CreateCoreWebView2Environment=WvxCreateEnvBasic")
+#pragma comment(linker, "/EXPORT:GetAvailableCoreWebView2BrowserVersionString=WvxGetAvail")
+#pragma comment(linker, "/EXPORT:GetAvailableCoreWebView2BrowserVersionStringWithOptions=WvxGetAvailOpts")
+#pragma comment(linker, "/EXPORT:CompareBrowserVersions=WvxCompareBrowserVersions")
 
 // ---- Entry ----
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
