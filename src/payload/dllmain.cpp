@@ -185,10 +185,43 @@ static HRESULT WINAPI HookedCreateEnvInternal(
 // -------- Loader discovery --------
 static std::atomic<bool> g_hooked{false};
 
+// Dump every named export of a module into the log so we can see the full
+// surface Volt might invoke.
+static void DumpModuleExports(HMODULE m, const char* tag) {
+    if (!m) return;
+    BYTE* base = reinterpret_cast<BYTE*>(m);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return;
+    auto exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+    auto names = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
+    auto ords  = reinterpret_cast<WORD*>(base + exp->AddressOfNameOrdinals);
+    auto funcs = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
+    Log("=== %s exports (nfuncs=%lu nnames=%lu) ===", tag, exp->NumberOfFunctions, exp->NumberOfNames);
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+        const char* n = reinterpret_cast<const char*>(base + names[i]);
+        WORD ord = ords[i];
+        DWORD frva = funcs[ord];
+        void* addr = base + frva;
+        BYTE* p = reinterpret_cast<BYTE*>(addr);
+        Log("  [%u] %s @ +0x%lx  prologue: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+            (unsigned)(exp->Base + ord), n, frva,
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
+    }
+}
+
 static bool TryHookLoader(HMODULE m) {
     if (g_hooked.load()) return true;
     MH_STATUS s = MH_Initialize();
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { Log("MH_Initialize failed %d", (int)s); return false; }
+
+    // Diagnostics: publish handle and dump the full export set once.
+    g_ebwHandle = m;
+    g_loaderHandle = m;
+    DumpModuleExports(m, "EBW/loader");
 
     // Standard entry point (present in WebView2Loader.dll).
     if (auto p = GetProcAddress(m, "CreateCoreWebView2EnvironmentWithOptions")) {
@@ -260,16 +293,43 @@ static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR name, HANDLE f, DWORD flags) 
     return m;
 }
 
+// -------- GetProcAddress hook — logs every symbol resolution against the loader --------
+using pfn_GetProcAddress = FARPROC (WINAPI*)(HMODULE, LPCSTR);
+static pfn_GetProcAddress g_origGPA = nullptr;
+static HMODULE g_ebwHandle = nullptr;
+static HMODULE g_loaderHandle = nullptr;
+
+static FARPROC WINAPI HookedGetProcAddress(HMODULE h, LPCSTR name) {
+    FARPROC r = g_origGPA(h, name);
+    if (h && (h == g_ebwHandle || h == g_loaderHandle)) {
+        // name may be ordinal (low bits) or string pointer
+        if (reinterpret_cast<ULONG_PTR>(name) < 0x10000) {
+            Log("GetProcAddress(EBW/loader, ord#%u) -> %p", (unsigned)(ULONG_PTR)name, r);
+        } else {
+            Log("GetProcAddress(EBW/loader, \"%s\") -> %p", name, r);
+        }
+    }
+    return r;
+}
+
 static void InstallLLHook() {
     MH_STATUS s = MH_Initialize();
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) return;
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    auto pLL = k32 ? GetProcAddress(k32, "LoadLibraryExW") : nullptr;
-    if (!pLL) return;
-    if (MH_CreateHook(reinterpret_cast<void*>(pLL), reinterpret_cast<void*>(&HookedLoadLibraryExW),
-                      reinterpret_cast<void**>(&g_origLL)) == MH_OK) {
-        MH_EnableHook(reinterpret_cast<void*>(pLL));
-        Log("LoadLibraryExW hooked as fallback");
+    if (!k32) return;
+    if (auto pLL = GetProcAddress(k32, "LoadLibraryExW")) {
+        if (MH_CreateHook(reinterpret_cast<void*>(pLL), reinterpret_cast<void*>(&HookedLoadLibraryExW),
+                          reinterpret_cast<void**>(&g_origLL)) == MH_OK) {
+            MH_EnableHook(reinterpret_cast<void*>(pLL));
+            Log("LoadLibraryExW hooked as fallback");
+        }
+    }
+    if (auto pGPA = GetProcAddress(k32, "GetProcAddress")) {
+        if (MH_CreateHook(reinterpret_cast<void*>(pGPA), reinterpret_cast<void*>(&HookedGetProcAddress),
+                          reinterpret_cast<void**>(&g_origGPA)) == MH_OK) {
+            MH_EnableHook(reinterpret_cast<void*>(pGPA));
+            Log("GetProcAddress hooked for diagnostics");
+        }
     }
 }
 
@@ -305,16 +365,16 @@ static PVOID g_ldrCookie = nullptr;
 static VOID CALLBACK DllNotifyCB(ULONG reason, PLDR_DLL_NOTIFICATION_DATA_T data, PVOID) {
     if (reason != 1 /*LDR_DLL_NOTIFICATION_REASON_LOADED*/) return;
     if (!data || !data->Loaded.BaseDllName || !data->Loaded.BaseDllName->Buffer) return;
-    const wchar_t* name = data->Loaded.BaseDllName->Buffer;
+    const wchar_t* raw = data->Loaded.BaseDllName->Buffer;
     USHORT clen = data->Loaded.BaseDllName->Length / sizeof(wchar_t);
-    // BaseDllName may not be nul-terminated; compare case-insensitive up to clen.
-    auto matches = [&](const wchar_t* pat) {
-        USHORT plen = (USHORT)lstrlenW(pat);
-        if (clen != plen) return false;
-        return _wcsnicmp(name, pat, clen) == 0;
-    };
-    if (matches(L"EmbeddedBrowserWebView.dll") || matches(L"WebView2Loader.dll")) {
-        Log("LdrNotify: %.*ls loaded @ %p", (int)clen, name, data->Loaded.DllBase);
+    wchar_t name[MAX_PATH]; if (clen >= MAX_PATH) clen = MAX_PATH - 1;
+    memcpy(name, raw, clen * sizeof(wchar_t)); name[clen] = 0;
+
+    // Log every load so we can trace ordering.
+    Log("LdrNotify LOADED: %ls @ %p sz=%lu", name, data->Loaded.DllBase, data->Loaded.SizeOfImage);
+
+    if (_wcsicmp(name, L"EmbeddedBrowserWebView.dll") == 0
+        || _wcsicmp(name, L"WebView2Loader.dll") == 0) {
         TryHookLoader((HMODULE)data->Loaded.DllBase);
     }
 }
