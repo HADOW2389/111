@@ -57,16 +57,15 @@ static pfn_CreateEnvOpts g_origCreateEnv = nullptr;
 
 // Internal loader export used by Wry when WebView2Loader.dll is bypassed
 // (Volt hits this path via Microsoft.MSEdgeWebView.Loader SxS activation).
-// Signature reverse-engineered from EmbeddedBrowserWebView.dll:
+// Signature reverse-engineered from EmbeddedBrowserWebView.dll v151 via Ghidra:
 //   HRESULT WINAPI CreateWebViewEnvironmentWithOptionsInternal(
-//       BOOL installCheckFlag,
-//       LPCWSTR browserExecutableFolder, LPCWSTR userDataFolder,
-//       LPCWSTR additionalBrowserArguments, LPCWSTR additionalClientArguments,
-//       LPCWSTR targetCompatibleBrowserVersion,
-//       BOOL allowSingleSignOnUsingOSPrimaryAccount,
-//       ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* handler);
+//       BOOL     flag,                          // RCX
+//       int      mode,                          // RDX
+//       void*    browserOrSettings,             // R8
+//       void*    other,                         // R9
+//       ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* handler); // stack [rsp+0x28]
 using pfn_CreateEnvInternal = HRESULT (WINAPI*)(
-    BOOL, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, BOOL,
+    BOOL, int, void*, void*,
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
 static pfn_CreateEnvInternal g_origCreateEnvInternal = nullptr;
 
@@ -173,16 +172,17 @@ static HRESULT STDMETHODCALLTYPE HookedCreateEnv(
 }
 
 static HRESULT WINAPI HookedCreateEnvInternal(
-    BOOL installCheckFlag, LPCWSTR bef, LPCWSTR udf,
-    LPCWSTR addlBrowserArgs, LPCWSTR addlClientArgs,
-    LPCWSTR targetVersion, BOOL allowSSO,
+    BOOL flag, int mode, void* browserOrSettings, void* other,
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* handler)
 {
-    Log("CreateWebViewEnvironmentWithOptionsInternal intercepted (bef=%ls udf=%ls target=%ls)",
-        bef ? bef : L"(null)", udf ? udf : L"(null)", targetVersion ? targetVersion : L"(null)");
+    Log("CreateWebViewEnvironmentWithOptionsInternal intercepted flag=%d mode=%d handler=%p",
+        flag, mode, (void*)handler);
+    if (!handler) {
+        // Original returns E_POINTER; keep the same behaviour.
+        return g_origCreateEnvInternal(flag, mode, browserOrSettings, other, handler);
+    }
     auto wrap = new EnvHandler(handler);
-    HRESULT hr = g_origCreateEnvInternal(installCheckFlag, bef, udf, addlBrowserArgs,
-                                         addlClientArgs, targetVersion, allowSSO, wrap);
+    HRESULT hr = g_origCreateEnvInternal(flag, mode, browserOrSettings, other, wrap);
     wrap->Release();
     return hr;
 }
