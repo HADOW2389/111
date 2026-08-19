@@ -79,6 +79,15 @@ using pfn_CreateCtrl = HRESULT (STDMETHODCALLTYPE*)(
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*);
 static pfn_CreateCtrl g_origCreateCtrl = nullptr;
 
+// Extended slot: ICoreWebView2Environment10::CreateCoreWebView2ControllerWithOptions.
+// Signature from Ghidra reverse of EmbeddedBrowserWebView.dll v151 slot 21:
+//   HRESULT (this, HWND parentWindow, ICoreWebView2ControllerOptions* options,
+//            ICoreWebView2CreateCoreWebView2ControllerCompletedHandler* handler)
+using pfn_CreateCtrlWithOpts = HRESULT (STDMETHODCALLTYPE*)(
+    ICoreWebView2Environment*, HWND, void*,
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*);
+static pfn_CreateCtrlWithOpts g_origCreateCtrlWithOpts = nullptr;
+
 class CtrlHandler final : public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler {
     std::atomic<LONG> m_ref{1};
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler* m_orig;
@@ -122,15 +131,39 @@ static HRESULT STDMETHODCALLTYPE HookedCreateCtrl(
     return hr;
 }
 
+static HRESULT STDMETHODCALLTYPE HookedCreateCtrlWithOpts(
+    ICoreWebView2Environment* self, HWND parent, void* options,
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler* handler)
+{
+    Log("CreateCoreWebView2ControllerWithOptions called handler=%p options=%p",
+        (void*)handler, options);
+    if (!handler) {
+        return g_origCreateCtrlWithOpts(self, parent, options, handler);
+    }
+    auto wrap = new CtrlHandler(handler);
+    HRESULT hr = g_origCreateCtrlWithOpts(self, parent, options, wrap);
+    wrap->Release();
+    return hr;
+}
+
 static void PatchEnvVTable(ICoreWebView2Environment* env) {
-    if (g_origCreateCtrl) return;
+    if (g_origCreateCtrl && g_origCreateCtrlWithOpts) return;
     void** vtbl = *reinterpret_cast<void***>(env);
-    g_origCreateCtrl = reinterpret_cast<pfn_CreateCtrl>(vtbl[3]);
+
+    // Slot 3 — ICoreWebView2Environment::CreateCoreWebView2Controller (base).
+    // Slot 21 — ICoreWebView2Environment10::CreateCoreWebView2ControllerWithOptions
+    // (Wry actually uses this one; the base slot only exists for older SDKs).
+    // Slot 22 is CompositionControllerWithOptions — same wrap shape works.
     DWORD old;
-    if (VirtualProtect(&vtbl[3], sizeof(void*), PAGE_READWRITE, &old)) {
+    if (VirtualProtect(vtbl, 32 * sizeof(void*), PAGE_READWRITE, &old)) {
+        g_origCreateCtrl = reinterpret_cast<pfn_CreateCtrl>(vtbl[3]);
         vtbl[3] = reinterpret_cast<void*>(&HookedCreateCtrl);
-        VirtualProtect(&vtbl[3], sizeof(void*), old, &old);
-        Log("v-table patched: CreateCoreWebView2Controller -> hook");
+
+        g_origCreateCtrlWithOpts = reinterpret_cast<pfn_CreateCtrlWithOpts>(vtbl[21]);
+        vtbl[21] = reinterpret_cast<void*>(&HookedCreateCtrlWithOpts);
+
+        VirtualProtect(vtbl, 32 * sizeof(void*), old, &old);
+        Log("v-table patched: slot3 CreateController + slot21 CreateControllerWithOptions -> hooks");
     } else {
         Log("VirtualProtect failed for env vtable: %lu", GetLastError());
     }
