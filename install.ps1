@@ -1,31 +1,41 @@
-# install.ps1 — deploy WebView2Loader.dll shim into Volt.
-# No admin required — target is %LOCALAPPDATA%\Volt.
+# install.ps1 — deploy volt-launcher.exe + payload.dll and create desktop shortcut.
 $ErrorActionPreference = 'Stop'
 
-$voltDir  = Join-Path $env:LOCALAPPDATA 'Volt'
-$srcShim  = Join-Path $PSScriptRoot     'WebView2Loader.dll'
-$dstShim  = Join-Path $voltDir          'WebView2Loader.dll'
-$logHint  = Join-Path $env:TEMP         'volt-bypass.log'
+$voltDir     = Join-Path $env:LOCALAPPDATA 'Volt'
+$installDir  = Join-Path $env:LOCALAPPDATA 'VoltBypass'
+$srcLauncher = Join-Path $PSScriptRoot     'volt-launcher.exe'
+$srcPayload  = Join-Path $PSScriptRoot     'payload.dll'
+$dstLauncher = Join-Path $installDir       'volt-launcher.exe'
+$dstPayload  = Join-Path $installDir       'payload.dll'
+$logHint     = Join-Path $env:TEMP         'volt-bypass.log'
+$shortcut    = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Volt (bypassed).lnk'
 
-# Clean up the previous approach if it's still there.
-Remove-Item -Force (Join-Path $voltDir 'dwmapi.dll')       -ErrorAction SilentlyContinue
-Remove-Item -Force (Join-Path $voltDir 'dwmapi_real.dll')  -ErrorAction SilentlyContinue
+if (-not (Test-Path $voltDir))      { throw "Volt not installed at $voltDir" }
+if (-not (Test-Path $srcLauncher))  { throw "Missing: $srcLauncher" }
+if (-not (Test-Path $srcPayload))   { throw "Missing: $srcPayload" }
 
-if (-not (Test-Path $voltDir)) { throw "Volt not installed at $voltDir" }
-if (-not (Test-Path $srcShim)) { throw "Missing shim next to install.ps1: $srcShim" }
+# Clean up prior attempts.
+Remove-Item -Force (Join-Path $voltDir 'dwmapi.dll')          -ErrorAction SilentlyContinue
+Remove-Item -Force (Join-Path $voltDir 'dwmapi_real.dll')     -ErrorAction SilentlyContinue
+Remove-Item -Force (Join-Path $voltDir 'WebView2Loader.dll')  -ErrorAction SilentlyContinue
 
-Copy-Item -Force $srcShim $dstShim
+New-Item -ItemType Directory -Force $installDir | Out-Null
+Copy-Item -Force $srcLauncher $dstLauncher
+Copy-Item -Force $srcPayload  $dstPayload
 
-Write-Host "[OK] deployed: $dstShim"
+# Desktop shortcut.
+$ws = New-Object -ComObject WScript.Shell
+$sh = $ws.CreateShortcut($shortcut)
+$sh.TargetPath        = $dstLauncher
+$sh.WorkingDirectory  = $installDir
+$sh.IconLocation      = (Join-Path $voltDir 'tauri-app.exe') + ',0'
+$sh.Description       = 'Launch Volt with API bypass injected'
+$sh.Save()
+
+Write-Host "[OK] deployed:"
+Write-Host "     $dstLauncher"
+Write-Host "     $dstPayload"
+Write-Host "     $shortcut"
 Write-Host ""
-Write-Host "Launch Volt. Bypass log will appear at:"
-Write-Host "  $logHint"
-Write-Host ""
-Write-Host "Expected log lines:"
-Write-Host "  shim attached to tauri-app.exe"
-Write-Host "  EdgeWebView pv=..."
-Write-Host "  real loader: ..."
-Write-Host "  CreateCoreWebView2EnvironmentWithOptions (shim)"
-Write-Host "  EnvironmentCreated hr=0x00000000"
-Write-Host "  v-table patched: CreateCoreWebView2Controller -> hook"
-Write-Host "  preload injected hr=0x00000000"
+Write-Host "Launch Volt from the new 'Volt (bypassed)' desktop shortcut."
+Write-Host "Bypass log: $logHint"

@@ -1,5 +1,0 @@
-LIBRARY dwmapi
-EXPORTS
-    DwmGetWindowAttribute=dwmapi_real.DwmGetWindowAttribute
-    DwmEnableBlurBehindWindow=dwmapi_real.DwmEnableBlurBehindWindow
-    DwmSetWindowAttribute=dwmapi_real.DwmSetWindowAttribute

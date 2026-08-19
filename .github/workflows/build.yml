@@ -18,6 +18,10 @@ jobs:
         with:
           arch: x64
 
+      - name: Fetch MinHook
+        shell: pwsh
+        run: git clone --depth=1 https://github.com/TsudaKageyu/minhook.git deps/minhook
+
       - name: Fetch WebView2 SDK
         shell: pwsh
         run: |
@@ -25,19 +29,34 @@ jobs:
           Invoke-WebRequest 'https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2792.45' -OutFile deps\wv2.zip
           Expand-Archive -Force deps\wv2.zip -DestinationPath deps\wv2
 
-      - name: Build WebView2Loader.dll shim
+      - name: Build payload.dll
         shell: cmd
         run: |
           if not exist dist mkdir dist
           cl /nologo /std:c++17 /LD /MT /EHsc /O2 /W3 /GS- /permissive- ^
              /DWIN32 /D_WINDOWS /D_USRDLL /DUNICODE /D_UNICODE ^
              /I"deps\wv2\build\native\include" ^
-             src\dllmain.cpp ^
-             /link /OUT:dist\WebView2Loader.dll ^
-             ole32.lib oleaut32.lib user32.lib advapi32.lib kernel32.lib shlwapi.lib
+             /I"deps\minhook\include" ^
+             src\payload\dllmain.cpp ^
+             deps\minhook\src\hook.c ^
+             deps\minhook\src\buffer.c ^
+             deps\minhook\src\trampoline.c ^
+             deps\minhook\src\hde\hde64.c ^
+             /link /OUT:dist\payload.dll ^
+             ole32.lib oleaut32.lib user32.lib advapi32.lib kernel32.lib shlwapi.lib psapi.lib
           if errorlevel 1 exit /b 1
 
-      - name: Stage install helpers
+      - name: Build volt-launcher.exe
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /MT /EHsc /O2 /W3 /GS- /permissive- ^
+             /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
+             src\launcher\launcher.cpp ^
+             /link /OUT:dist\volt-launcher.exe /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup ^
+             user32.lib shlwapi.lib kernel32.lib
+          if errorlevel 1 exit /b 1
+
+      - name: Stage helpers
         shell: pwsh
         run: |
           Copy-Item install.ps1   dist\install.ps1
