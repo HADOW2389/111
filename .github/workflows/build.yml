@@ -1,0 +1,68 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Fetch MinHook
+        shell: pwsh
+        run: |
+          git clone --depth=1 https://github.com/TsudaKageyu/minhook.git deps/minhook
+
+      - name: Fetch WebView2 SDK
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force deps/wv2 | Out-Null
+          Invoke-WebRequest 'https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2792.45' -OutFile deps\wv2.zip
+          Expand-Archive -Force deps\wv2.zip -DestinationPath deps\wv2
+
+      - name: Build dwmapi.dll
+        shell: cmd
+        run: |
+          if not exist dist mkdir dist
+          cl /nologo /std:c++17 /LD /MT /EHsc /O2 /W3 /GS- /permissive- ^
+             /DWIN32 /D_WINDOWS /D_USRDLL /DUNICODE /D_UNICODE ^
+             /I"deps\wv2\build\native\include" ^
+             /I"deps\minhook\include" ^
+             src\dllmain.cpp ^
+             deps\minhook\src\hook.c ^
+             deps\minhook\src\buffer.c ^
+             deps\minhook\src\trampoline.c ^
+             deps\minhook\src\hde\hde64.c ^
+             /link /DEF:src\dwmapi.def /OUT:dist\dwmapi.dll ^
+             ole32.lib oleaut32.lib user32.lib advapi32.lib kernel32.lib shlwapi.lib
+          if errorlevel 1 exit /b 1
+
+      - name: Stage install helpers
+        shell: pwsh
+        run: |
+          Copy-Item install.ps1   dist\install.ps1
+          Copy-Item uninstall.ps1 dist\uninstall.ps1
+          Copy-Item README.md     dist\README.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: volt-bypass
+          path: dist/**
+          if-no-files-found: error
+
+      - name: Release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**

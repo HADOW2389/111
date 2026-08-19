@@ -1,0 +1,11 @@
+deps/
+dist/
+build/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.dll
+!src/**/*.dll
+.vs/
