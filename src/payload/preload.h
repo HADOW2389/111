@@ -6,6 +6,39 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   if (globalThis.__vbz_installed) return;
   globalThis.__vbz_installed = true;
 
+  // Overlay logger — appears in the Volt UI so we can read the trace without
+  // a devtools attach. Each fetch/xhr/invoke call is a green line.
+  const _log = [];
+  const _overlay = () => {
+    if (!document.body) return null;
+    let el = document.getElementById("__vbz_overlay");
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = "__vbz_overlay";
+    el.style.cssText = "position:fixed;left:0;right:0;bottom:0;max-height:40vh;overflow:auto;background:rgba(0,0,0,.92);color:#0f0;font:11px/1.3 monospace;z-index:2147483647;padding:4px 8px;border-top:1px solid #0f0;pointer-events:auto;";
+    document.body.appendChild(el);
+    for (const line of _log) {
+      const p = document.createElement("div"); p.textContent = line; el.appendChild(p);
+    }
+    return el;
+  };
+  const trace = (kind, ...rest) => {
+    const line = "[vbz] " + kind + " " + rest.map(x => {
+      try { return typeof x === "string" ? x : JSON.stringify(x).slice(0, 200); }
+      catch { return String(x); }
+    }).join(" ");
+    _log.push(line);
+    try { console.warn(line); } catch {}
+    const el = _overlay();
+    if (el) { const p = document.createElement("div"); p.textContent = line; el.appendChild(p); el.scrollTop = el.scrollHeight; }
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _overlay, { once: true });
+  } else {
+    _overlay();
+  }
+  setTimeout(_overlay, 500); setTimeout(_overlay, 2000);
+
   const HOSTS = /(?:^|\.)(voltbz\.net|volt\.gg|volt\.com\.im|volt\.onl|voltapp\.[a-z.]+)$/i;
   const targeted = (u) => {
     try { return HOSTS.test(new URL(u, location.href).hostname); }
@@ -133,8 +166,11 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   const origFetch = window.fetch.bind(window);
   window.fetch = async function(input, init) {
     const url = (typeof input === "string") ? input : (input && input.url) || "";
+    const method = (init && init.method) || "GET";
+    // Log EVERY fetch — even non-targeted — so we see the real endpoint the app is calling.
+    trace("FETCH", method, url);
     if (!targeted(url)) return origFetch(input, init);
-    console.warn("[vbz] fetch intercept ->", url);
+    trace("FETCH-FAKE", url);
     return okJson(buildFakeResponse());
   };
 
@@ -143,9 +179,10 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   XMLHttpRequest.prototype.open = function(m, u, ...r) { this.__vbz_url = u; this.__vbz_method = m; return XOpen.call(this, m, u, ...r); };
   XMLHttpRequest.prototype.send = function(body) {
     const url = this.__vbz_url;
+    trace("XHR", this.__vbz_method || "?", url || "?");
     if (!url || !targeted(url)) return XSend.call(this, body);
     const xhr = this;
-    console.warn("[vbz] xhr intercept ->", url);
+    trace("XHR-FAKE", url);
     xhr.addEventListener("readystatechange", function() {
       if (xhr.readyState !== 4) return;
       const mutated = JSON.stringify(buildFakeResponse());
@@ -174,11 +211,12 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
       const orig = t.invoke.bind(t);
       t.invoke = async (cmd, args, opts) => {
         const cmdS = typeof cmd === "string" ? cmd : "";
+        trace("INVOKE", cmdS, args);
         // Tauri http plugin -> check URL inside args
         if (/plugin:http/i.test(cmdS)) {
-          const url = args?.url || args?.request?.url || "";
+          const url = args?.url || args?.request?.url || args?.options?.url || "";
           if (typeof url === "string" && targeted(url)) {
-            console.warn("[vbz] invoke http intercept ->", cmdS, url);
+            trace("INVOKE-HTTP-FAKE", url);
             const body = JSON.stringify(buildFakeResponse());
             return {
               status: 200,
@@ -193,16 +231,18 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
           }
         }
         if (AUTH_CMD_RE.test(cmdS)) {
-          console.warn("[vbz] invoke auth intercept ->", cmdS);
-          try {
-            const res = await orig(cmd, args, opts);
-            // Even if backend responded, replace with our synthetic answer.
-            return buildFakeResponse();
-          } catch (e) {
-            return buildFakeResponse();
-          }
+          trace("INVOKE-AUTH-FAKE", cmdS);
+          try { await orig(cmd, args, opts); } catch (e) {}
+          return buildFakeResponse();
         }
-        return orig(cmd, args, opts);
+        try {
+          const r = await orig(cmd, args, opts);
+          trace("INVOKE-RES", cmdS, r);
+          return r;
+        } catch (e) {
+          trace("INVOKE-ERR", cmdS, String(e));
+          throw e;
+        }
       };
       t.__vbz_wrapped = true;
       console.warn("[vbz] wrapped invoke on", t);
