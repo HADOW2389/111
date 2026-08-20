@@ -15,17 +15,23 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
     el.setAttribute("data-vbz", "1");
     el.style.cssText = [
       "position:fixed !important",
-      "left:0 !important", "right:0 !important", "bottom:0 !important",
-      "max-height:45vh !important", "overflow:auto !important",
-      "background:rgba(0,0,0,.92) !important", "color:#0f0 !important",
-      "font:11px/1.3 monospace !important",
+      "left:0 !important", "top:0 !important",
+      "width:340px !important", "max-height:160px !important",
+      "overflow:auto !important",
+      "background:rgba(0,0,0,.75) !important", "color:#0f0 !important",
+      "font:10px/1.25 monospace !important",
       "z-index:2147483647 !important",
-      "padding:4px 8px !important",
-      "border-top:1px solid #0f0 !important",
+      "padding:3px 5px !important",
+      "border:1px solid rgba(0,255,0,.35) !important",
+      "border-radius:0 0 4px 0 !important",
       "pointer-events:auto !important",
       "white-space:pre-wrap !important",
       "word-break:break-all !important",
+      "opacity:0.85 !important",
+      "cursor:pointer !important",
     ].join(";");
+    el.title = "click to hide";
+    el.addEventListener("click", () => { el.style.display = el.style.display === "none" ? "block" : "none"; });
     for (const line of _log) {
       const p = document.createElement("div"); p.textContent = line; el.appendChild(p);
     }
@@ -59,10 +65,20 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   for (const d of [50, 200, 500, 1000, 2000, 5000, 10000]) setTimeout(_ensureOverlay, d);
   trace("BOOT", "preload live", location.href);
 
-  const HOSTS = /(?:^|\.)(voltbz\.net|volt\.gg|volt\.com\.im|volt\.onl|voltapp\.[a-z.]+)$/i;
+  const HOSTS = /(?:^|\.)(voltbz\.(?:net|org|com|io|dev)|volt\.gg|volt\.com\.im|volt\.onl|voltapp\.[a-z.]+)$/i;
+  const IPC_HOST = /^ipc\.localhost$/i;
+  const AUTH_PATH = /(?:^|\/)(?:login|signin|sign[_-]?in|auth(?:enticate)?|token|session|whoami|me|refresh|check.?key|hwid|verify|entitle|subscri|premium|whitelist|user|profile|activate|register|account|creds?)(?:[\/?#]|$)/i;
+
   const targeted = (u) => {
-    try { return HOSTS.test(new URL(u, location.href).hostname); }
-    catch { return false; }
+    try {
+      const url = new URL(u, location.href);
+      if (HOSTS.test(url.hostname)) return true;
+      // Tauri v2 IPC transport: POST http://ipc.localhost/<command>.
+      // We only want to touch auth-shaped commands here so we don't break
+      // window/dialog/fs plugin calls.
+      if (IPC_HOST.test(url.hostname) && AUTH_PATH.test(url.pathname)) return true;
+      return false;
+    } catch { return false; }
   };
 
   const rndToken = () => "vbz_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
