@@ -6,38 +6,58 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   if (globalThis.__vbz_installed) return;
   globalThis.__vbz_installed = true;
 
-  // Overlay logger — appears in the Volt UI so we can read the trace without
-  // a devtools attach. Each fetch/xhr/invoke call is a green line.
+  // Overlay logger — attached to <html> (documentElement), not <body>, and
+  // reattached by MutationObserver whenever React tears the DOM down.
   const _log = [];
-  const _overlay = () => {
-    if (!document.body) return null;
-    let el = document.getElementById("__vbz_overlay");
-    if (el) return el;
-    el = document.createElement("div");
+  const _mkOverlay = () => {
+    const el = document.createElement("div");
     el.id = "__vbz_overlay";
-    el.style.cssText = "position:fixed;left:0;right:0;bottom:0;max-height:40vh;overflow:auto;background:rgba(0,0,0,.92);color:#0f0;font:11px/1.3 monospace;z-index:2147483647;padding:4px 8px;border-top:1px solid #0f0;pointer-events:auto;";
-    document.body.appendChild(el);
+    el.setAttribute("data-vbz", "1");
+    el.style.cssText = [
+      "position:fixed !important",
+      "left:0 !important", "right:0 !important", "bottom:0 !important",
+      "max-height:45vh !important", "overflow:auto !important",
+      "background:rgba(0,0,0,.92) !important", "color:#0f0 !important",
+      "font:11px/1.3 monospace !important",
+      "z-index:2147483647 !important",
+      "padding:4px 8px !important",
+      "border-top:1px solid #0f0 !important",
+      "pointer-events:auto !important",
+      "white-space:pre-wrap !important",
+      "word-break:break-all !important",
+    ].join(";");
     for (const line of _log) {
       const p = document.createElement("div"); p.textContent = line; el.appendChild(p);
     }
     return el;
   };
+  const _ensureOverlay = () => {
+    if (!document.documentElement) return null;
+    let el = document.getElementById("__vbz_overlay");
+    if (el && el.isConnected) return el;
+    el = _mkOverlay();
+    // Attach to <html>, not <body> — survives body swaps.
+    document.documentElement.appendChild(el);
+    return el;
+  };
   const trace = (kind, ...rest) => {
     const line = "[vbz] " + kind + " " + rest.map(x => {
-      try { return typeof x === "string" ? x : JSON.stringify(x).slice(0, 200); }
+      try { return typeof x === "string" ? x : JSON.stringify(x).slice(0, 400); }
       catch { return String(x); }
     }).join(" ");
     _log.push(line);
     try { console.warn(line); } catch {}
-    const el = _overlay();
+    const el = _ensureOverlay();
     if (el) { const p = document.createElement("div"); p.textContent = line; el.appendChild(p); el.scrollTop = el.scrollHeight; }
   };
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", _overlay, { once: true });
-  } else {
-    _overlay();
-  }
-  setTimeout(_overlay, 500); setTimeout(_overlay, 2000);
+  _ensureOverlay();
+  // Reattach if React or the app removes it.
+  try {
+    new MutationObserver(() => _ensureOverlay())
+      .observe(document.documentElement || document, { childList: true, subtree: true });
+  } catch {}
+  for (const d of [50, 200, 500, 1000, 2000, 5000, 10000]) setTimeout(_ensureOverlay, d);
+  trace("BOOT", "preload live", location.href);
 
   const HOSTS = /(?:^|\.)(voltbz\.net|volt\.gg|volt\.com\.im|volt\.onl|voltapp\.[a-z.]+)$/i;
   const targeted = (u) => {
