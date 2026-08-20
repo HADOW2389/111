@@ -128,30 +128,14 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   // that a shallow merge cannot satisfy.
   const isAuthUrl = (u) => /(?:login|signin|sign_in|auth|token|session|whoami|me\b|refresh|check.?key|hwid|verify|entitle|subscri|premium|whitelist|user|profile)/i.test(u);
 
+  // voltbz.net is entirely an internal API (auth + entitlements + script hub).
+  // Everything we hit against it gets the same synthetic answer.
   const origFetch = window.fetch.bind(window);
   window.fetch = async function(input, init) {
     const url = (typeof input === "string") ? input : (input && input.url) || "";
     if (!targeted(url)) return origFetch(input, init);
-
-    const authy = isAuthUrl(url);
-
-    let res;
-    try { res = await origFetch(input, init); }
-    catch (e) { return okJson(authy ? buildFakeResponse() : enrich({}, 0)); }
-
-    // For auth-shaped URLs always synthesize — real backend answer is never
-    // rich enough (needs deep paths like data.session.accessToken).
-    if (authy) return okJson(buildFakeResponse());
-
-    if (res.status === 401 || res.status === 403 || res.status === 402 || res.status === 404) {
-      return okJson(enrich({}, 0));
-    }
-    const ct = (res.headers.get("content-type") || "").toLowerCase();
-    if (!ct.includes("json")) return res;
-    let data;
-    try { data = await res.clone().json(); } catch { return res; }
-    if (data == null || typeof data !== "object") return okJson(enrich({}, 0));
-    return okJson(enrich(data, 0));
+    console.warn("[vbz] fetch intercept ->", url);
+    return okJson(buildFakeResponse());
   };
 
   const XOpen = XMLHttpRequest.prototype.open;
@@ -161,27 +145,14 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
     const url = this.__vbz_url;
     if (!url || !targeted(url)) return XSend.call(this, body);
     const xhr = this;
-    const authy = isAuthUrl(url);
+    console.warn("[vbz] xhr intercept ->", url);
     xhr.addEventListener("readystatechange", function() {
       if (xhr.readyState !== 4) return;
-      let text = ""; try { text = xhr.responseText || ""; } catch {}
-      let mutated = null;
-      if (authy) {
-        mutated = JSON.stringify(buildFakeResponse());
-      } else if (xhr.status === 401 || xhr.status === 403 || xhr.status === 402 || xhr.status === 404) {
-        mutated = JSON.stringify(enrich({}, 0));
-      } else {
-        const ct = (xhr.getResponseHeader && xhr.getResponseHeader("content-type") || "").toLowerCase();
-        if (ct.includes("json") && text) {
-          try { mutated = JSON.stringify(enrich(JSON.parse(text), 0)); } catch {}
-        }
-      }
-      if (mutated != null) {
-        try { Object.defineProperty(xhr, "responseText", { get: () => mutated, configurable: true }); } catch {}
-        try { Object.defineProperty(xhr, "response",     { get: () => mutated, configurable: true }); } catch {}
-        try { Object.defineProperty(xhr, "status",       { get: () => 200,     configurable: true }); } catch {}
-        try { Object.defineProperty(xhr, "statusText",   { get: () => "OK",    configurable: true }); } catch {}
-      }
+      const mutated = JSON.stringify(buildFakeResponse());
+      try { Object.defineProperty(xhr, "responseText", { get: () => mutated, configurable: true }); } catch {}
+      try { Object.defineProperty(xhr, "response",     { get: () => mutated, configurable: true }); } catch {}
+      try { Object.defineProperty(xhr, "status",       { get: () => 200,     configurable: true }); } catch {}
+      try { Object.defineProperty(xhr, "statusText",   { get: () => "OK",    configurable: true }); } catch {}
     }, true);
     return XSend.call(this, body);
   };
@@ -190,34 +161,54 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
     Object.defineProperty(window, "__VOLT_PREMIUM__", { value: true, writable: false, configurable: false });
   } catch {}
 
-  // Tauri v2 IPC bridge: some apps route auth through invoke() rather than fetch.
-  // Best-effort wrap: if window.__TAURI__ or window.__TAURI_INTERNALS__.invoke exists,
-  // intercept auth-shaped commands and return synthetic success.
+  // Tauri v2 IPC. login might go through invoke() rather than fetch, and
+  // Tauri's http plugin routes fetch() through invoke('plugin:http|fetch', ...).
+  // We intercept:
+  //   * auth-named commands -> synthesize fake response
+  //   * plugin:http|fetch when the URL targets voltbz -> synthesize fake response
+  const AUTH_CMD_RE = /login|signin|auth|token|session|refresh|whoami|me|user|profile|whitelist|premium|verify|entitle|subscri|check.?key|hwid|activate|register/i;
   const wrapInvoke = () => {
     const targets = [window.__TAURI__?.core, window.__TAURI__, window.__TAURI_INTERNALS__];
     for (const t of targets) {
       if (!t || !t.invoke || t.__vbz_wrapped) continue;
       const orig = t.invoke.bind(t);
       t.invoke = async (cmd, args, opts) => {
-        try {
-          const res = await orig(cmd, args, opts);
-          if (typeof cmd === "string" && /login|auth|token|whitelist|premium|verify|session|check_key|hwid/i.test(cmd)) {
-            return enrich(typeof res === "object" && res !== null ? res : {}, 0);
+        const cmdS = typeof cmd === "string" ? cmd : "";
+        // Tauri http plugin -> check URL inside args
+        if (/plugin:http/i.test(cmdS)) {
+          const url = args?.url || args?.request?.url || "";
+          if (typeof url === "string" && targeted(url)) {
+            console.warn("[vbz] invoke http intercept ->", cmdS, url);
+            const body = JSON.stringify(buildFakeResponse());
+            return {
+              status: 200,
+              statusText: "OK",
+              headers: { "content-type": "application/json; charset=utf-8" },
+              url,
+              ok: true,
+              data: body,
+              body,
+              rid: 0,
+            };
           }
-          return res;
-        } catch (e) {
-          if (typeof cmd === "string" && /login|auth|token|whitelist|premium|verify|session|check_key|hwid/i.test(cmd)) {
-            return enrich({}, 0);
-          }
-          throw e;
         }
+        if (AUTH_CMD_RE.test(cmdS)) {
+          console.warn("[vbz] invoke auth intercept ->", cmdS);
+          try {
+            const res = await orig(cmd, args, opts);
+            // Even if backend responded, replace with our synthetic answer.
+            return buildFakeResponse();
+          } catch (e) {
+            return buildFakeResponse();
+          }
+        }
+        return orig(cmd, args, opts);
       };
       t.__vbz_wrapped = true;
+      console.warn("[vbz] wrapped invoke on", t);
     }
   };
   wrapInvoke();
-  setTimeout(wrapInvoke, 100);
-  setTimeout(wrapInvoke, 500);
-  setTimeout(wrapInvoke, 2000);
+  for (const d of [50, 100, 200, 500, 1000, 2000, 5000]) setTimeout(wrapInvoke, d);
 })();
 )JS_PRELOAD";
