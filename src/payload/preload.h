@@ -187,15 +187,33 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
     return f;
   };
 
-  const enrich = (v, depth = 0) => {
-    if (depth > 6 || v == null) return v;
-    if (Array.isArray(v)) return v.map(x => enrich(x, depth + 1));
-    if (typeof v === "object") {
-      const f = FLAGS();
-      for (const k of Object.keys(f)) if (!(k in v)) v[k] = f[k];
-      for (const k of Object.keys(v)) if (v[k] && typeof v[k] === "object") v[k] = enrich(v[k], depth + 1);
-      return v;
-    }
+  // Primitive-only flags for pass-through enrichment. Adding nested objects
+  // (session/user/subscription) here would create cycles when clients receive
+  // objects named "subscription" and we merge a "subscription: {...}" into them.
+  const FLAT_FLAGS = () => ({
+    premium: true, isPremium: true, is_premium: true,
+    paid: true, isPaid: true,
+    active: true, isActive: true,
+    verified: true, isVerified: true,
+    authorized: true, isAuthorized: true,
+    authenticated: true, isAuthenticated: true,
+    banned: false, isBanned: false, is_banned: false,
+    whitelisted: true, whitelist: true, is_whitelisted: true, isWhitelisted: true,
+    hwid_valid: true, hwidValid: true, valid: true, isValid: true,
+    ok: true, success: true,
+    role: "premium",
+    tier: "lifetime", plan: "lifetime", type: "premium",
+    expires_at: FAR_FUTURE, expiresAt: FAR_FUTURE,
+  });
+
+  const enrich = (v, depth = 0, seen = new WeakSet()) => {
+    if (depth > 6 || v == null || typeof v !== "object") return v;
+    if (seen.has(v)) return v;
+    seen.add(v);
+    if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = enrich(v[i], depth + 1, seen); return v; }
+    const f = FLAT_FLAGS();
+    for (const k of Object.keys(f)) if (!(k in v)) v[k] = f[k];
+    for (const k of Object.keys(v)) if (v[k] && typeof v[k] === "object") v[k] = enrich(v[k], depth + 1, seen);
     return v;
   };
 
