@@ -67,19 +67,31 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
 
   const HOSTS = /(?:^|\.)(voltbz\.(?:net|org|com|io|dev)|volt\.gg|volt\.com\.im|volt\.onl|voltapp\.[a-z.]+)$/i;
   const IPC_HOST = /^ipc\.localhost$/i;
-  const AUTH_PATH = /(?:^|\/)(?:login|signin|sign[_-]?in|auth(?:enticate)?|token|session|whoami|me|refresh|check.?key|hwid|verify|entitle|subscri|premium|whitelist|user|profile|activate|register|account|creds?)(?:[\/?#]|$)/i;
+  // Auth-shaped path pattern. Everything else (health, version, release,
+  // download, files, executor manifests, IPC file ops) must pass through untouched.
+  const AUTH_PATH = /(?:^|\/)(?:login|signin|sign[_-]?in|authenticate|token|session|whoami|refresh|check[_-]?key|hwid|verify|entitle|subscri|premium|whitelist|activate)(?:[\/?#]|$)/i;
 
-  const targeted = (u) => {
+  // Two decisions per URL:
+  //  * fakeAuth(url)   — synthesize a fake premium/session response
+  //  * enrichable(url) — pass through the real response but merge premium fields in
+  const fakeAuth = (u) => {
     try {
       const url = new URL(u, location.href);
-      if (HOSTS.test(url.hostname)) return true;
-      // Tauri v2 IPC transport: POST http://ipc.localhost/<command>.
-      // We only want to touch auth-shaped commands here so we don't break
-      // window/dialog/fs plugin calls.
-      if (IPC_HOST.test(url.hostname) && AUTH_PATH.test(url.pathname)) return true;
-      return false;
+      if ((HOSTS.test(url.hostname) || IPC_HOST.test(url.hostname))
+          && AUTH_PATH.test(url.pathname)) return true;
+    } catch {}
+    return false;
+  };
+  const enrichable = (u) => {
+    try {
+      const url = new URL(u, location.href);
+      if (fakeAuth(u)) return false;
+      // Only voltbz backend responses get enrichment; IPC responses stay raw.
+      return HOSTS.test(url.hostname);
     } catch { return false; }
   };
+  // Kept for compatibility with older log lines.
+  const targeted = (u) => fakeAuth(u) || enrichable(u);
 
   const rndToken = () => "vbz_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   const FAR_FUTURE = 9999999999;
@@ -197,17 +209,34 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   // that a shallow merge cannot satisfy.
   const isAuthUrl = (u) => /(?:login|signin|sign_in|auth|token|session|whoami|me\b|refresh|check.?key|hwid|verify|entitle|subscri|premium|whitelist|user|profile)/i.test(u);
 
-  // voltbz.net is entirely an internal API (auth + entitlements + script hub).
-  // Everything we hit against it gets the same synthetic answer.
   const origFetch = window.fetch.bind(window);
   window.fetch = async function(input, init) {
     const url = (typeof input === "string") ? input : (input && input.url) || "";
     const method = (init && init.method) || "GET";
-    // Log EVERY fetch — even non-targeted — so we see the real endpoint the app is calling.
     trace("FETCH", method, url);
-    if (!targeted(url)) return origFetch(input, init);
-    trace("FETCH-FAKE", url);
-    return okJson(buildFakeResponse());
+
+    // Auth-shaped → synthesize a full fake response.
+    if (fakeAuth(url)) {
+      trace("FETCH-FAKE", url);
+      return okJson(buildFakeResponse());
+    }
+
+    // voltbz non-auth (version, health, release, download descriptors) —
+    // pass through but merge premium flags into any JSON body.
+    if (enrichable(url)) {
+      let res;
+      try { res = await origFetch(input, init); }
+      catch (e) { trace("FETCH-PT-ERR", url, String(e)); throw e; }
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (!ct.includes("json")) { trace("FETCH-PT-RAW", res.status, url); return res; }
+      let data;
+      try { data = await res.clone().json(); } catch { trace("FETCH-PT-BADJSON", url); return res; }
+      trace("FETCH-PT-JSON", res.status, url);
+      if (data == null || typeof data !== "object") return res;
+      return okJson(enrich(data, 0));
+    }
+
+    return origFetch(input, init);
   };
 
   const XOpen = XMLHttpRequest.prototype.open;
@@ -216,16 +245,30 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   XMLHttpRequest.prototype.send = function(body) {
     const url = this.__vbz_url;
     trace("XHR", this.__vbz_method || "?", url || "?");
-    if (!url || !targeted(url)) return XSend.call(this, body);
+    if (!url) return XSend.call(this, body);
     const xhr = this;
-    trace("XHR-FAKE", url);
+    const wantFake = fakeAuth(url);
+    const wantEnrich = enrichable(url);
+    if (!wantFake && !wantEnrich) return XSend.call(this, body);
+    if (wantFake) trace("XHR-FAKE", url);
     xhr.addEventListener("readystatechange", function() {
       if (xhr.readyState !== 4) return;
-      const mutated = JSON.stringify(buildFakeResponse());
-      try { Object.defineProperty(xhr, "responseText", { get: () => mutated, configurable: true }); } catch {}
-      try { Object.defineProperty(xhr, "response",     { get: () => mutated, configurable: true }); } catch {}
-      try { Object.defineProperty(xhr, "status",       { get: () => 200,     configurable: true }); } catch {}
-      try { Object.defineProperty(xhr, "statusText",   { get: () => "OK",    configurable: true }); } catch {}
+      let mutated = null;
+      if (wantFake) {
+        mutated = JSON.stringify(buildFakeResponse());
+      } else if (wantEnrich) {
+        let text = ""; try { text = xhr.responseText || ""; } catch {}
+        const ct = (xhr.getResponseHeader && xhr.getResponseHeader("content-type") || "").toLowerCase();
+        if (ct.includes("json") && text) {
+          try { mutated = JSON.stringify(enrich(JSON.parse(text), 0)); } catch {}
+        }
+      }
+      if (mutated != null) {
+        try { Object.defineProperty(xhr, "responseText", { get: () => mutated, configurable: true }); } catch {}
+        try { Object.defineProperty(xhr, "response",     { get: () => mutated, configurable: true }); } catch {}
+        try { Object.defineProperty(xhr, "status",       { get: () => 200,     configurable: true }); } catch {}
+        try { Object.defineProperty(xhr, "statusText",   { get: () => "OK",    configurable: true }); } catch {}
+      }
     }, true);
     return XSend.call(this, body);
   };
