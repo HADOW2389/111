@@ -237,23 +237,26 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
     let args = null;
     if (argsBody) { try { args = JSON.parse(argsBody); } catch {} }
 
+    // file_exists — full passthrough now that the payload files really are on
+    // disk under %LOCALAPPDATA%\Volt\Components. Rust returns the truth and
+    // client checks pass on their own.
     if (/^file_exists$/i.test(path)) {
-      const p = String((args && (args.path || args.file)) || "");
-      // Only lie about Volt payload files. RobloxPlayerBeta.s.dll etc must
-      // reflect reality or path validation blows up.
-      if (/\\(emulator|executor|dll|volt|bin)\.(dll|bin)$/i.test(p)) {
-        trace("IPC-FAKE file_exists TRUE", p);
-        return "true";
-      }
-      trace("IPC file_exists PT", p);
+      trace("IPC file_exists PT", String((args && (args.path || args.file)) || ""));
       return null;
     }
-    // check_update_with_domains: passthrough so Rust actually fetches the real
-    // release manifest from Volt's server. Client will then trigger download.
-    // If server rejects with 401/premium error we'll see it in overlay.
-    if (/^(get_release|get_volt_files_release|check_release)$/i.test(path)) {
-      trace("IPC-FAKE release stub");
-      return JSON.stringify({ ok: true, files: [] });
+    // check_update_with_domains: server is Cloudflare-locked (403 without a
+    // real session), so we synthesize a "no update needed" UpdateMetadata
+    // structure. Client accepts it → skips update flow → uses installed files.
+    if (/^check_update_with_domains$/i.test(path)) {
+      trace("IPC-FAKE check_update no-update");
+      return JSON.stringify({
+        rid: 0,
+        currentVersion: "1.0.8",
+        version: "1.0.8",
+        date: "2026-08-21T00:00:00Z",
+        body: "up to date",
+        rawJson: "{}"
+      });
     }
     return null;                           // unhandled — passthrough
   };
