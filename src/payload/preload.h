@@ -238,8 +238,15 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
     if (argsBody) { try { args = JSON.parse(argsBody); } catch {} }
 
     if (/^file_exists$/i.test(path)) {
-      trace("IPC-FAKE file_exists", args && args.path);
-      return "true";                       // JSON boolean
+      const p = String((args && (args.path || args.file)) || "");
+      // Only lie about Volt payload files. RobloxPlayerBeta.s.dll etc must
+      // reflect reality or path validation blows up.
+      if (/\\(emulator|executor|dll|volt|bin)\.(dll|bin)$/i.test(p)) {
+        trace("IPC-FAKE file_exists TRUE", p);
+        return "true";
+      }
+      trace("IPC file_exists PT", p);
+      return null;
     }
     if (/^check_update_with_domains$/i.test(path)) {
       trace("IPC-FAKE check_update no-update");
