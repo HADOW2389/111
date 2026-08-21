@@ -6,17 +6,22 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   if (globalThis.__vbz_installed) return;
   globalThis.__vbz_installed = true;
 
-  // Reset any cached "release failed" / "install failed" state — Volt saves
-  // it and stops re-checking, so overlay never sees the IPC we intercept.
+  // Nuke all persistent client state so the client refetches release info and
+  // hits our intercept. Volt keeps its "install failed" verdict in some
+  // key we don't want to enumerate — safer to wipe everything except the
+  // UI-only preferences.
+  const KEEP = /^volt-editor-settings$|^volt-source-map/;
   try {
-    for (const k of Object.keys(localStorage)) {
-      if (/volt|release|install|update|error|fail|files/i.test(k)) {
-        localStorage.removeItem(k);
-      }
-    }
+    for (const k of Object.keys(localStorage)) if (!KEEP.test(k)) localStorage.removeItem(k);
   } catch {}
   try {
     for (const k of Object.keys(sessionStorage)) sessionStorage.removeItem(k);
+  } catch {}
+  // Clear IndexedDB too (Volt may cache release state there).
+  try {
+    if (indexedDB.databases) {
+      indexedDB.databases().then(dbs => { for (const db of dbs) if (db.name) indexedDB.deleteDatabase(db.name); });
+    }
   } catch {}
 
   // Overlay logger — attached to <html> (documentElement), not <body>, and
