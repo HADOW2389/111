@@ -227,20 +227,62 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   // that a shallow merge cannot satisfy.
   const isAuthUrl = (u) => /(?:login|signin|sign_in|auth|token|session|whoami|me\b|refresh|check.?key|hwid|verify|entitle|subscri|premium|whitelist|user|profile)/i.test(u);
 
+  // ---- Tauri v2 IPC responder ----------------------------------------------
+  // ipc.localhost/<command> is Tauri v2's HTTP transport for invoke(). Body is
+  // raw JSON of the return value. We craft fake returns that make Volt think:
+  //   * every executor file is already present (Emulator.dll etc.)
+  //   * updater sees currentVersion == version, so no download is attempted
+  //   * misc side-commands that just gate UI return OK
+  const fakeIPC = async (path, argsBody) => {
+    let args = null;
+    if (argsBody) { try { args = JSON.parse(argsBody); } catch {} }
+
+    if (/^file_exists$/i.test(path)) {
+      trace("IPC-FAKE file_exists", args && args.path);
+      return "true";                       // JSON boolean
+    }
+    if (/^check_update_with_domains$/i.test(path)) {
+      trace("IPC-FAKE check_update no-update");
+      const now = new Date().toISOString();
+      return JSON.stringify({
+        rid: 0,
+        currentVersion: "1.0.8",
+        version: "1.0.8",                  // ==currentVersion → "up to date"
+        date: now,
+        body: "",
+        rawJson: "{}",
+      });
+    }
+    if (/^(get_release|get_volt_files_release|check_release)$/i.test(path)) {
+      trace("IPC-FAKE release stub");
+      return JSON.stringify({ ok: true, files: [] });
+    }
+    return null;                           // unhandled — passthrough
+  };
+
   const origFetch = window.fetch.bind(window);
   window.fetch = async function(input, init) {
     const url = (typeof input === "string") ? input : (input && input.url) || "";
     const method = (init && init.method) || "GET";
     trace("FETCH", method, url);
 
-    // Auth-shaped → synthesize a full fake response.
+    // Tauri v2 HTTP-IPC
+    try {
+      const u = new URL(url, location.href);
+      if (/^ipc\.localhost$/i.test(u.hostname)) {
+        const path = decodeURIComponent(u.pathname.replace(/^\//, ""));
+        const body = init && typeof init.body === "string" ? init.body : null;
+        const fake = await fakeIPC(path, body);
+        if (fake !== null) return okJson(JSON.parse(fake));
+        return origFetch(input, init);
+      }
+    } catch {}
+
     if (fakeAuth(url)) {
       trace("FETCH-FAKE", url);
       return okJson(buildFakeResponse());
     }
 
-    // voltbz non-auth (version, health, release, download descriptors) —
-    // pass through but merge premium flags into any JSON body.
     if (enrichable(url)) {
       let res;
       try { res = await origFetch(input, init); }
