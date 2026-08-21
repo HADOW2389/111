@@ -6,6 +6,19 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
   if (globalThis.__vbz_installed) return;
   globalThis.__vbz_installed = true;
 
+  // Reset any cached "release failed" / "install failed" state — Volt saves
+  // it and stops re-checking, so overlay never sees the IPC we intercept.
+  try {
+    for (const k of Object.keys(localStorage)) {
+      if (/volt|release|install|update|error|fail|files/i.test(k)) {
+        localStorage.removeItem(k);
+      }
+    }
+  } catch {}
+  try {
+    for (const k of Object.keys(sessionStorage)) sessionStorage.removeItem(k);
+  } catch {}
+
   // Overlay logger — attached to <html> (documentElement), not <body>, and
   // reattached by MutationObserver whenever React tears the DOM down.
   const _log = [];
