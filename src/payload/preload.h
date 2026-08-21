@@ -271,6 +271,21 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
         rawJson: "{}"
       });
     }
+    // Install path — client thinks install already completed.
+    if (/^installer$/i.test(path)) {
+      trace("IPC-FAKE installer success");
+      return JSON.stringify({ success: true, installed: true, version: "1.0.8" });
+    }
+    // Download path — files are already on disk under Components/, skip.
+    if (/^download_file_from_url_cmd$/i.test(path)) {
+      trace("IPC-FAKE download_file skip", String((args && args.url) || ""));
+      return JSON.stringify({ success: true, downloaded: true, skipped: true });
+    }
+    // Version info for the local payload files.
+    if (/^get_volt_bin_version(_info)?$/i.test(path)) {
+      trace("IPC-FAKE volt_bin_version 1.0.8");
+      return JSON.stringify({ version: "1.0.8", info: "1.0.8" });
+    }
     return null;                           // unhandled — passthrough
   };
 
