@@ -248,18 +248,9 @@ static const wchar_t* const kPreloadJS = LR"JS_PRELOAD(
       trace("IPC file_exists PT", p);
       return null;
     }
-    if (/^check_update_with_domains$/i.test(path)) {
-      trace("IPC-FAKE check_update no-update");
-      const now = new Date().toISOString();
-      return JSON.stringify({
-        rid: 0,
-        currentVersion: "1.0.8",
-        version: "1.0.8",                  // ==currentVersion → "up to date"
-        date: now,
-        body: "",
-        rawJson: "{}",
-      });
-    }
+    // check_update_with_domains: passthrough so Rust actually fetches the real
+    // release manifest from Volt's server. Client will then trigger download.
+    // If server rejects with 401/premium error we'll see it in overlay.
     if (/^(get_release|get_volt_files_release|check_release)$/i.test(path)) {
       trace("IPC-FAKE release stub");
       return JSON.stringify({ ok: true, files: [] });
